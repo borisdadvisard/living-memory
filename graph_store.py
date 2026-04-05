@@ -1,15 +1,25 @@
 """
 graph_store.py — DuckDB-backed knowledge graph for Living Memory
 
-Tables:
-  nodes           — entities with JSON properties and FLOAT[N] embeddings
-  edges           — directed weighted relationships between nodes
-  adjacency_cache — precomputed bidirectional multi-hop neighbourhood
+Tables (Universal Graph ontology):
+  entities         — people, places, orgs, objects, concepts
+  events           — things that happen (deliveries, meetings, etc.)
+  commitments      — obligations with owner, due time, status
+  state_assertions — time-bounded beliefs about subjects
+  sources          — origin of information
+  relations        — typed, temporal connections between any two objects
+  embeddings       — unified HNSW-indexed vectors across all object types
+  summaries        — generated summaries scoped to entity/project/window
+  clusters         — thematic groupings of objects
+  adjacency_cache  — precomputed cross-type bidirectional neighbourhood
 
-The VSS extension provides an HNSW index on node embeddings for fast
-semantic_search. All write paths hold self._lock so DuckDB access is
-single-threaded. The _executor serialises fire-and-forget writes from the
-synchronous voice pipeline without blocking audio playback.
+Temporal model (3 layers):
+  Event time  — start_time / end_time on events
+  Valid time  — valid_from / valid_to on relations and state_assertions
+  System time — created_at everywhere
+
+Backward-compat wrappers keep the old upsert_node / add_edge surface
+working so main.py can migrate incrementally.
 """
 
 import asyncio
@@ -31,84 +41,263 @@ log = logging.getLogger(__name__)
 DB_PATH       = Path(__file__).parent / "graph.db"
 EMBEDDING_DIM = int(os.getenv("LM_EMBEDDING_DIM", "768"))
 
-# Controlled relationship vocabulary — living-memory.md: ~15 types max
-ALLOWED_RELATIONSHIPS: frozenset[str] = frozenset({
-    "knows", "works_at", "lives_in", "part_of", "related_to",
-    "created_by", "used_by", "located_in", "owned_by", "instance_of",
-    "caused_by", "followed_by", "contradicts", "supports", "mentions",
+ENTITY_TYPES: frozenset[str] = frozenset({
+    "person", "place", "org", "object", "concept", "digital_object",
 })
+
+EVENT_TYPES: frozenset[str] = frozenset({
+    "delivery", "meeting", "conversation", "transaction", "state_change",
+})
+
+COMMITMENT_STATUSES: frozenset[str] = frozenset({
+    "planned", "confirmed", "completed", "cancelled",
+})
+
+COMMITMENT_PRIORITIES: frozenset[str] = frozenset({
+    "low", "medium", "high",
+})
+
+ALLOWED_RELATION_TYPES: frozenset[str] = frozenset({
+    # Entity ↔ Entity
+    "knows", "owns", "works_for", "lives_in", "located_in", "part_of",
+    # Entity ↔ Event
+    "participates_in", "organizes", "affected_by",
+    # Entity ↔ Commitment
+    "owns_commitment", "responsible_for",
+    # Event ↔ Event
+    "depends_on", "follows", "blocks",
+    # General purpose
+    "related_to", "created_by", "used_by", "caused_by", "mentions",
+})
+
+# Alias for backward-compat imports
+ALLOWED_RELATIONSHIPS = ALLOWED_RELATION_TYPES
+
+# Label → entity type mapping used by migration and upsert_node wrapper
+_LABEL_TO_TYPE: dict[str, str] = {
+    "person": "person",
+    "place": "place",
+    "organisation": "org",
+    "organization": "org",
+    "org": "org",
+    "concept": "concept",
+    "object": "object",
+    "digital_object": "digital_object",
+    "event": "concept",   # old Event nodes demoted to concept
+    "unknown": "concept",
+}
+
+# Old relationship names that need remapping
+_REL_REMAP: dict[str, str] = {
+    "works_at":    "works_for",
+    "instance_of": "part_of",
+    "followed_by": "follows",
+    "contradicts": "related_to",
+    "supports":    "related_to",
+}
 
 # ---------------------------------------------------------------------------
 # SCHEMA DDL
 # ---------------------------------------------------------------------------
 
 _SCHEMA_STMTS = [
-    "CREATE SEQUENCE IF NOT EXISTS nodes_seq START 1",
-    "CREATE SEQUENCE IF NOT EXISTS edges_seq START 1",
-    f"""
-    CREATE TABLE IF NOT EXISTS nodes (
-        id         BIGINT    DEFAULT nextval('nodes_seq') PRIMARY KEY,
+    # ── Entities ─────────────────────────────────────────────────────────
+    """
+    CREATE TABLE IF NOT EXISTS entities (
+        id         UUID      DEFAULT gen_random_uuid() PRIMARY KEY,
+        type       TEXT      NOT NULL,
         name       TEXT      NOT NULL,
-        label      TEXT      NOT NULL,
-        properties JSON,
-        embedding  FLOAT[{EMBEDDING_DIM}],
+        aliases    JSON      DEFAULT '[]',
+        attributes JSON      DEFAULT '{}',
+        confidence REAL      DEFAULT 1.0,
+        source_ids JSON      DEFAULT '[]',
         created_at TIMESTAMP DEFAULT now(),
         updated_at TIMESTAMP DEFAULT now()
     )
     """,
-    "CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_name ON nodes(name)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_entities_name ON entities(name)",
+    "CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(type)",
+
+    # ── Events ───────────────────────────────────────────────────────────
     """
-    CREATE TABLE IF NOT EXISTS edges (
-        id           BIGINT DEFAULT nextval('edges_seq') PRIMARY KEY,
-        from_id      BIGINT NOT NULL,
-        to_id        BIGINT NOT NULL,
-        relationship TEXT   NOT NULL,
-        weight       REAL   DEFAULT 1.0,
-        created_at   TIMESTAMP DEFAULT now()
+    CREATE TABLE IF NOT EXISTS events (
+        id               UUID      DEFAULT gen_random_uuid() PRIMARY KEY,
+        type             TEXT      NOT NULL,
+        title            TEXT      NOT NULL,
+        description      TEXT,
+        start_time       TIMESTAMP,
+        end_time         TIMESTAMP,
+        participants     JSON      DEFAULT '[]',
+        location_id      UUID,
+        related_entities JSON      DEFAULT '[]',
+        source_ids       JSON      DEFAULT '[]',
+        confidence       REAL      DEFAULT 1.0,
+        created_at       TIMESTAMP DEFAULT now()
     )
     """,
-    "CREATE UNIQUE INDEX IF NOT EXISTS idx_edges_unique ON edges(from_id, to_id, relationship)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_events_title ON events(title)",
+    "CREATE INDEX IF NOT EXISTS idx_events_type ON events(type)",
+    "CREATE INDEX IF NOT EXISTS idx_events_start ON events(start_time)",
+
+    # ── Commitments ───────────────────────────────────────────────────────
+    """
+    CREATE TABLE IF NOT EXISTS commitments (
+        id               UUID      DEFAULT gen_random_uuid() PRIMARY KEY,
+        title            TEXT      NOT NULL,
+        description      TEXT,
+        owner_id         UUID,
+        related_event_id UUID,
+        due_time         TIMESTAMP,
+        status           TEXT      DEFAULT 'planned',
+        priority         TEXT      DEFAULT 'medium',
+        constraints      JSON      DEFAULT '{}',
+        source_ids       JSON      DEFAULT '[]',
+        created_at       TIMESTAMP DEFAULT now()
+    )
+    """,
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_commitments_title ON commitments(title)",
+    "CREATE INDEX IF NOT EXISTS idx_commitments_status ON commitments(status)",
+    "CREATE INDEX IF NOT EXISTS idx_commitments_due ON commitments(due_time)",
+
+    # ── State Assertions ──────────────────────────────────────────────────
+    """
+    CREATE TABLE IF NOT EXISTS state_assertions (
+        id           UUID      DEFAULT gen_random_uuid() PRIMARY KEY,
+        subject_id   UUID      NOT NULL,
+        subject_type TEXT      NOT NULL,
+        predicate    TEXT      NOT NULL,
+        value        JSON      NOT NULL,
+        valid_from   TIMESTAMP DEFAULT now(),
+        valid_to     TIMESTAMP,
+        confidence   REAL      DEFAULT 1.0,
+        source_ids   JSON      DEFAULT '[]'
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_assertions_subject ON state_assertions(subject_id)",
+
+    # ── Sources ───────────────────────────────────────────────────────────
+    """
+    CREATE TABLE IF NOT EXISTS sources (
+        id        UUID      DEFAULT gen_random_uuid() PRIMARY KEY,
+        type      TEXT      NOT NULL,
+        content   TEXT,
+        author_id UUID,
+        timestamp TIMESTAMP DEFAULT now(),
+        metadata  JSON      DEFAULT '{}'
+    )
+    """,
+
+    # ── Relations ─────────────────────────────────────────────────────────
+    """
+    CREATE TABLE IF NOT EXISTS relations (
+        id         UUID      DEFAULT gen_random_uuid() PRIMARY KEY,
+        from_id    UUID      NOT NULL,
+        from_type  TEXT      NOT NULL,
+        to_id      UUID      NOT NULL,
+        to_type    TEXT      NOT NULL,
+        type       TEXT      NOT NULL,
+        valid_from TIMESTAMP,
+        valid_to   TIMESTAMP,
+        confidence REAL      DEFAULT 1.0,
+        source_ids JSON      DEFAULT '[]',
+        created_at TIMESTAMP DEFAULT now()
+    )
+    """,
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_relations_unique ON relations(from_id, to_id, type)",
+    "CREATE INDEX IF NOT EXISTS idx_relations_from ON relations(from_id)",
+    "CREATE INDEX IF NOT EXISTS idx_relations_to ON relations(to_id)",
+    "CREATE INDEX IF NOT EXISTS idx_relations_type ON relations(type)",
+
+    # ── Embeddings ────────────────────────────────────────────────────────
+    f"""
+    CREATE TABLE IF NOT EXISTS embeddings (
+        object_id   TEXT NOT NULL,
+        object_type TEXT NOT NULL,
+        vector      FLOAT[{EMBEDDING_DIM}],
+        model       TEXT DEFAULT 'nomic-embed-text',
+        PRIMARY KEY (object_id, object_type)
+    )
+    """,
+
+    # ── Summaries ─────────────────────────────────────────────────────────
+    """
+    CREATE TABLE IF NOT EXISTS summaries (
+        id           UUID      DEFAULT gen_random_uuid() PRIMARY KEY,
+        scope        TEXT      NOT NULL,
+        content      TEXT      NOT NULL,
+        generated_at TIMESTAMP DEFAULT now(),
+        source_ids   JSON      DEFAULT '[]'
+    )
+    """,
+
+    # ── Clusters ──────────────────────────────────────────────────────────
+    """
+    CREATE TABLE IF NOT EXISTS clusters (
+        id      UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+        type    TEXT NOT NULL,
+        members JSON DEFAULT '[]'
+    )
+    """,
+
+    # ── Adjacency Cache ───────────────────────────────────────────────────
     """
     CREATE TABLE IF NOT EXISTS adjacency_cache (
-        node_id     BIGINT  NOT NULL,
-        neighbor_id BIGINT  NOT NULL,
-        hops        INTEGER NOT NULL,
-        PRIMARY KEY (node_id, neighbor_id)
+        node_id       TEXT NOT NULL,
+        node_type     TEXT NOT NULL,
+        neighbor_id   TEXT NOT NULL,
+        neighbor_type TEXT NOT NULL,
+        hops          INTEGER NOT NULL,
+        PRIMARY KEY (node_id, node_type, neighbor_id, neighbor_type)
     )
     """,
+    "CREATE INDEX IF NOT EXISTS idx_adj_node ON adjacency_cache(node_id, node_type)",
 ]
 
-_HNSW_STMT = "CREATE INDEX IF NOT EXISTS nodes_embedding_hnsw ON nodes USING HNSW(embedding)"
+_HNSW_STMT = (
+    "CREATE INDEX IF NOT EXISTS embeddings_vector_hnsw "
+    "ON embeddings USING HNSW(vector)"
+)
 
 # ---------------------------------------------------------------------------
 # ADJACENCY CACHE REBUILD
-# Bidirectional, up to 2 hops, stores min hop count for each node pair.
-# Covers five traversal patterns:
-#   1-hop forward / backward
-#   2-hop forward→forward  (A→B→C)
-#   2-hop backward→forward (A←B→C, siblings)
-#   2-hop forward→backward (A→B←C, co-neighbours)
+# Bidirectional, up to 2 hops, min hop count per pair.
+# Works across all object types via TEXT-cast UUIDs.
 # ---------------------------------------------------------------------------
 
 _REFRESH_STMTS = [
     "DELETE FROM adjacency_cache",
     """
-    INSERT INTO adjacency_cache (node_id, neighbor_id, hops)
-    SELECT node_id, neighbor_id, min(hops) FROM (
-        SELECT from_id AS node_id, to_id   AS neighbor_id, 1 AS hops FROM edges
+    INSERT INTO adjacency_cache (node_id, node_type, neighbor_id, neighbor_type, hops)
+    SELECT node_id, node_type, neighbor_id, neighbor_type, MIN(hops)
+    FROM (
+        SELECT from_id::TEXT AS node_id, from_type AS node_type,
+               to_id::TEXT   AS neighbor_id, to_type   AS neighbor_type,
+               1             AS hops
+          FROM relations
         UNION ALL
-        SELECT to_id   AS node_id, from_id AS neighbor_id, 1 AS hops FROM edges
+        SELECT to_id::TEXT   AS node_id, to_type   AS node_type,
+               from_id::TEXT AS neighbor_id, from_type AS neighbor_type,
+               1             AS hops
+          FROM relations
         UNION ALL
-        SELECT e1.from_id AS node_id, e2.to_id   AS neighbor_id, 2 AS hops
-          FROM edges e1 JOIN edges e2 ON e1.to_id  = e2.from_id
+        SELECT r1.from_id::TEXT AS node_id, r1.from_type AS node_type,
+               r2.to_id::TEXT   AS neighbor_id, r2.to_type   AS neighbor_type,
+               2                AS hops
+          FROM relations r1 JOIN relations r2 ON r1.to_id = r2.from_id
         UNION ALL
-        SELECT e1.to_id   AS node_id, e2.to_id   AS neighbor_id, 2 AS hops
-          FROM edges e1 JOIN edges e2 ON e1.from_id = e2.from_id
+        SELECT r1.to_id::TEXT   AS node_id, r1.to_type   AS node_type,
+               r2.to_id::TEXT   AS neighbor_id, r2.to_type   AS neighbor_type,
+               2                AS hops
+          FROM relations r1 JOIN relations r2 ON r1.from_id = r2.from_id
+         WHERE r1.to_id != r2.to_id
         UNION ALL
-        SELECT e1.from_id AS node_id, e2.from_id AS neighbor_id, 2 AS hops
-          FROM edges e1 JOIN edges e2 ON e1.to_id   = e2.to_id
+        SELECT r1.from_id::TEXT AS node_id, r1.from_type AS node_type,
+               r2.from_id::TEXT AS neighbor_id, r2.from_type AS neighbor_type,
+               2                AS hops
+          FROM relations r1 JOIN relations r2 ON r1.to_id = r2.to_id
+         WHERE r1.from_id != r2.from_id
     ) sub
-    GROUP BY node_id, neighbor_id
+    GROUP BY node_id, node_type, neighbor_id, neighbor_type
     HAVING node_id != neighbor_id
     """,
 ]
@@ -120,23 +309,29 @@ _REFRESH_STMTS = [
 
 class GraphStore:
     """
-    Thread-safe DuckDB knowledge graph.
+    Thread-safe DuckDB knowledge graph implementing the Universal Graph ontology.
 
-    Synchronous callers (voice_pipeline.py) use submit_* for fire-and-forget
-    writes. Async callers use async_* coroutines. Direct calls block.
+    Primary API: upsert_entity, upsert_event, upsert_commitment, add_relation,
+                 update_object_embedding, semantic_search, get_active_commitments.
+
+    Legacy API (backward-compat): upsert_node, add_edge, update_node_embedding,
+                 query_neighbors, search_nodes_by_name — all delegate to the
+                 primary API above.
+
+    All writes hold self._lock (single-threaded DuckDB access).
+    Fire-and-forget writes use self._executor (1 worker).
     """
 
     def __init__(self, db_path: Path = DB_PATH) -> None:
         self._conn = duckdb.connect(str(db_path))
         self._lock = threading.Lock()
-        # Single worker keeps writes serialised; caller is never blocked.
         self._executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="graph_writer"
         )
         self._init_schema()
 
     # ------------------------------------------------------------------
-    # SCHEMA INITIALISATION
+    # SCHEMA INITIALISATION + AUTO-MIGRATION
     # ------------------------------------------------------------------
 
     def _init_schema(self) -> None:
@@ -144,104 +339,349 @@ class GraphStore:
             try:
                 self._conn.execute("INSTALL vss")
             except duckdb.IOException:
-                pass  # already installed — safe to continue offline
+                pass
             self._conn.execute("LOAD vss")
-            for stmt in _SCHEMA_STMTS:
-                self._conn.execute(stmt)
-            # HNSW persistence is required for file-based databases
             self._conn.execute("SET hnsw_enable_experimental_persistence = true")
-            # HNSW index must be created after VSS is loaded
-            self._conn.execute(_HNSW_STMT)
+
+            tables = {
+                r[0]
+                for r in self._conn.execute(
+                    "SELECT table_name FROM information_schema.tables "
+                    "WHERE table_schema = 'main'"
+                ).fetchall()
+            }
+
+            if "nodes" in tables and "entities" not in tables:
+                log.info("Legacy schema detected — running automatic migration…")
+                # Create new tables first, then migrate data
+                for stmt in _SCHEMA_STMTS:
+                    self._conn.execute(stmt)
+                self._conn.execute(_HNSW_STMT)
+                self._run_migration()
+            else:
+                for stmt in _SCHEMA_STMTS:
+                    self._conn.execute(stmt)
+                self._conn.execute(_HNSW_STMT)
+
             log.debug("Schema initialised")
 
+    def _run_migration(self) -> None:
+        """
+        Migrate legacy nodes+edges data into the new ontology tables.
+        Called while self._lock is held. Leaves old tables (nodes, edges) intact.
+        Drops old adjacency_cache so it can be recreated with the new schema.
+        """
+        conn = self._conn
+        # The old adjacency_cache schema lacks node_type/neighbor_type columns.
+        # Drop it so _SCHEMA_STMTS can recreate it with the new structure.
+        conn.execute("DROP TABLE IF EXISTS adjacency_cache")
+
+        # Step 1 — nodes → entities
+        conn.execute("""
+            INSERT INTO entities (id, type, name, aliases, attributes,
+                                  confidence, source_ids, created_at, updated_at)
+            SELECT gen_random_uuid(),
+                   lower(label),
+                   name,
+                   '[]'::JSON,
+                   COALESCE(properties, '{}'),
+                   1.0,
+                   '[]'::JSON,
+                   created_at,
+                   updated_at
+            FROM nodes
+        """)
+
+        # Fix type values that don't map cleanly
+        conn.execute("""
+            UPDATE entities SET type = CASE
+                WHEN type = 'event'        THEN 'concept'
+                WHEN type = 'organisation' THEN 'org'
+                WHEN type = 'organization' THEN 'org'
+                WHEN type = 'unknown'      THEN 'concept'
+                WHEN type NOT IN ('person','place','org','object',
+                                  'concept','digital_object')
+                                           THEN 'concept'
+                ELSE type
+            END
+        """)
+
+        # Step 2 — embeddings from nodes.embedding → embeddings table
+        conn.execute(f"""
+            INSERT INTO embeddings (object_id, object_type, vector, model)
+            SELECT e.id::TEXT, 'entity', n.embedding, 'nomic-embed-text'
+            FROM nodes n
+            JOIN entities e ON n.name = e.name
+            WHERE n.embedding IS NOT NULL
+        """)
+
+        # Step 3a — edges → relations (normal remaps)
+        conn.execute("""
+            INSERT INTO relations (id, from_id, from_type, to_id, to_type, type,
+                                   valid_from, valid_to, confidence, source_ids, created_at)
+            SELECT gen_random_uuid(),
+                   ef.id,
+                   'entity',
+                   et.id,
+                   'entity',
+                   CASE ed.relationship
+                       WHEN 'works_at'    THEN 'works_for'
+                       WHEN 'instance_of' THEN 'part_of'
+                       WHEN 'followed_by' THEN 'follows'
+                       WHEN 'contradicts' THEN 'related_to'
+                       WHEN 'supports'    THEN 'related_to'
+                       ELSE ed.relationship
+                   END,
+                   NULL, NULL, 1.0, '[]'::JSON, ed.created_at
+            FROM edges ed
+            JOIN nodes  nf ON ed.from_id = nf.id
+            JOIN nodes  nt ON ed.to_id   = nt.id
+            JOIN entities ef ON nf.name  = ef.name
+            JOIN entities et ON nt.name  = et.name
+            WHERE ed.relationship != 'owned_by'
+        """)
+
+        # Step 3b — owned_by: invert direction → owns
+        conn.execute("""
+            INSERT INTO relations (id, from_id, from_type, to_id, to_type, type,
+                                   valid_from, valid_to, confidence, source_ids, created_at)
+            SELECT gen_random_uuid(),
+                   et.id,   -- swapped: owner is from
+                   'entity',
+                   ef.id,   -- swapped: owned thing is to
+                   'entity',
+                   'owns',
+                   NULL, NULL, 1.0, '[]'::JSON, ed.created_at
+            FROM edges ed
+            JOIN nodes  nf ON ed.from_id = nf.id
+            JOIN nodes  nt ON ed.to_id   = nt.id
+            JOIN entities ef ON nf.name  = ef.name
+            JOIN entities et ON nt.name  = et.name
+            WHERE ed.relationship = 'owned_by'
+        """)
+
+        # Step 4 — rebuild adjacency cache
+        for stmt in _REFRESH_STMTS:
+            conn.execute(stmt)
+
+        n_ent = conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
+        n_rel = conn.execute("SELECT COUNT(*) FROM relations").fetchone()[0]
+        n_emb = conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
+        log.info(
+            "Migration complete: %d entities, %d relations, %d embeddings",
+            n_ent, n_rel, n_emb,
+        )
+
     # ------------------------------------------------------------------
-    # NODES
+    # ENTITIES
     # ------------------------------------------------------------------
 
-    def upsert_node(
+    def upsert_entity(
         self,
         name: str,
-        label: str,
-        properties: dict | None = None,
-    ) -> int:
+        type: str,
+        aliases: list[str] | None = None,
+        attributes: dict | None = None,
+        confidence: float = 1.0,
+        source_ids: list[str] | None = None,
+    ) -> str:
         """
-        Insert a new node or update label/properties if name already exists.
-        Name is stripped and used as the deduplication key.
-        Returns the node id.
+        Insert or update an entity by name (dedup key).
+        Returns the entity UUID as a string.
         """
+        etype = type.lower().strip()
+        if etype not in ENTITY_TYPES:
+            etype = "concept"
         key = name.strip()
-        props_json = json.dumps(properties or {})
+        aliases_json   = json.dumps(aliases or [])
+        attributes_json = json.dumps(attributes or {})
+        source_json    = json.dumps(source_ids or [])
+
         with self._lock:
             self._conn.execute(
                 """
-                INSERT INTO nodes (name, label, properties)
-                VALUES (?, ?, ?::JSON)
+                INSERT INTO entities (type, name, aliases, attributes, confidence, source_ids)
+                VALUES (?, ?, ?::JSON, ?::JSON, ?, ?::JSON)
                 ON CONFLICT (name) DO UPDATE SET
-                    label      = EXCLUDED.label,
-                    properties = EXCLUDED.properties,
+                    type       = EXCLUDED.type,
+                    aliases    = EXCLUDED.aliases,
+                    attributes = EXCLUDED.attributes,
+                    confidence = EXCLUDED.confidence,
+                    source_ids = EXCLUDED.source_ids,
                     updated_at = now()
                 """,
-                [key, label.strip(), props_json],
+                [etype, key, aliases_json, attributes_json, confidence, source_json],
             )
             row = self._conn.execute(
-                "SELECT id FROM nodes WHERE name = ?", [key]
+                "SELECT id FROM entities WHERE name = ?", [key]
             ).fetchone()
-            return row[0]
-
-    def update_node_embedding(self, name: str, embedding: list[float]) -> None:
-        """Store a pre-computed embedding vector on an existing node."""
-        if len(embedding) != EMBEDDING_DIM:
-            raise ValueError(
-                f"Embedding must be {EMBEDDING_DIM}-dimensional, got {len(embedding)}"
-            )
-        with self._lock:
-            self._conn.execute(
-                f"UPDATE nodes SET embedding = ?::FLOAT[{EMBEDDING_DIM}] WHERE name = ?",
-                [embedding, name.strip()],
-            )
+            return str(row[0])
 
     # ------------------------------------------------------------------
-    # EDGES
+    # EVENTS
     # ------------------------------------------------------------------
 
-    def add_edge(
+    def upsert_event(
         self,
-        from_name: str,
-        to_name: str,
-        relationship: str,
-        weight: float = 1.0,
-    ) -> None:
+        title: str,
+        type: str,
+        description: str | None = None,
+        start_time: str | None = None,
+        end_time: str | None = None,
+        participants: list[str] | None = None,
+        location_id: str | None = None,
+        related_entities: list[str] | None = None,
+        confidence: float = 1.0,
+        source_ids: list[str] | None = None,
+    ) -> str:
         """
-        Add or update a directed weighted edge.
-        Endpoint nodes are auto-created with label 'Unknown' if absent.
-        Rebuilds the adjacency cache after every successful write.
+        Insert or update an event by title (dedup key).
+        start_time / end_time are ISO-8601 strings or None.
+        participants / related_entities are lists of entity UUID strings.
+        Returns the event UUID as a string.
         """
-        rel = relationship.lower().strip()
-        if rel not in ALLOWED_RELATIONSHIPS:
-            raise ValueError(
-                f"Relationship '{rel}' not in controlled vocabulary. "
-                f"Allowed: {sorted(ALLOWED_RELATIONSHIPS)}"
-            )
+        etype = type.lower().strip()
+        if etype not in EVENT_TYPES:
+            etype = "state_change"
+        key = title.strip()
+
         with self._lock:
-            for nm in (from_name.strip(), to_name.strip()):
-                self._conn.execute(
-                    "INSERT INTO nodes (name, label) VALUES (?, 'Unknown') ON CONFLICT (name) DO NOTHING",
-                    [nm],
-                )
-            from_id = self._conn.execute(
-                "SELECT id FROM nodes WHERE name = ?", [from_name.strip()]
-            ).fetchone()[0]
-            to_id = self._conn.execute(
-                "SELECT id FROM nodes WHERE name = ?", [to_name.strip()]
-            ).fetchone()[0]
             self._conn.execute(
                 """
-                INSERT INTO edges (from_id, to_id, relationship, weight)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT (from_id, to_id, relationship)
-                DO UPDATE SET weight = EXCLUDED.weight
+                INSERT INTO events (type, title, description, start_time, end_time,
+                                    participants, location_id, related_entities,
+                                    confidence, source_ids)
+                VALUES (?, ?, ?, ?::TIMESTAMP, ?::TIMESTAMP,
+                        ?::JSON, ?::UUID, ?::JSON, ?, ?::JSON)
+                ON CONFLICT (title) DO UPDATE SET
+                    type             = EXCLUDED.type,
+                    description      = EXCLUDED.description,
+                    start_time       = COALESCE(EXCLUDED.start_time, events.start_time),
+                    end_time         = COALESCE(EXCLUDED.end_time,   events.end_time),
+                    participants     = EXCLUDED.participants,
+                    location_id      = COALESCE(EXCLUDED.location_id, events.location_id),
+                    related_entities = EXCLUDED.related_entities,
+                    confidence       = EXCLUDED.confidence,
+                    source_ids       = EXCLUDED.source_ids
                 """,
-                [from_id, to_id, rel, float(weight)],
+                [
+                    etype, key, description,
+                    start_time, end_time,
+                    json.dumps(participants or []),
+                    location_id,
+                    json.dumps(related_entities or []),
+                    confidence,
+                    json.dumps(source_ids or []),
+                ],
+            )
+            row = self._conn.execute(
+                "SELECT id FROM events WHERE title = ?", [key]
+            ).fetchone()
+            return str(row[0])
+
+    # ------------------------------------------------------------------
+    # COMMITMENTS
+    # ------------------------------------------------------------------
+
+    def upsert_commitment(
+        self,
+        title: str,
+        description: str | None = None,
+        owner_id: str | None = None,
+        related_event_id: str | None = None,
+        due_time: str | None = None,
+        status: str = "planned",
+        priority: str = "medium",
+        constraints: dict | None = None,
+        source_ids: list[str] | None = None,
+    ) -> str:
+        """
+        Insert or update a commitment by title (dedup key).
+        owner_id and related_event_id are UUID strings or None.
+        Returns the commitment UUID as a string.
+        """
+        s = status.lower().strip() if status else "planned"
+        if s not in COMMITMENT_STATUSES:
+            s = "planned"
+        p = priority.lower().strip() if priority else "medium"
+        if p not in COMMITMENT_PRIORITIES:
+            p = "medium"
+        key = title.strip()
+
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO commitments (title, description, owner_id, related_event_id,
+                                         due_time, status, priority, constraints, source_ids)
+                VALUES (?, ?, ?::UUID, ?::UUID, ?::TIMESTAMP, ?, ?, ?::JSON, ?::JSON)
+                ON CONFLICT (title) DO UPDATE SET
+                    description      = EXCLUDED.description,
+                    owner_id         = COALESCE(EXCLUDED.owner_id, commitments.owner_id),
+                    related_event_id = COALESCE(EXCLUDED.related_event_id, commitments.related_event_id),
+                    due_time         = COALESCE(EXCLUDED.due_time, commitments.due_time),
+                    status           = EXCLUDED.status,
+                    priority         = EXCLUDED.priority,
+                    constraints      = EXCLUDED.constraints,
+                    source_ids       = EXCLUDED.source_ids
+                """,
+                [
+                    key, description,
+                    owner_id, related_event_id,
+                    due_time, s, p,
+                    json.dumps(constraints or {}),
+                    json.dumps(source_ids or []),
+                ],
+            )
+            row = self._conn.execute(
+                "SELECT id FROM commitments WHERE title = ?", [key]
+            ).fetchone()
+            return str(row[0])
+
+    # ------------------------------------------------------------------
+    # RELATIONS
+    # ------------------------------------------------------------------
+
+    def add_relation(
+        self,
+        from_id: str,
+        from_type: str,
+        to_id: str,
+        to_type: str,
+        relation_type: str,
+        valid_from: str | None = None,
+        valid_to: str | None = None,
+        confidence: float = 1.0,
+        source_ids: list[str] | None = None,
+    ) -> None:
+        """
+        Add or update a typed, temporal relation between any two graph objects.
+        from_id / to_id are UUID strings. Rebuilds adjacency cache on every write.
+        """
+        rel = relation_type.lower().strip()
+        if rel not in ALLOWED_RELATION_TYPES:
+            raise ValueError(
+                f"Relation type '{rel}' not in controlled vocabulary. "
+                f"Allowed: {sorted(ALLOWED_RELATION_TYPES)}"
+            )
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO relations (from_id, from_type, to_id, to_type, type,
+                                       valid_from, valid_to, confidence, source_ids)
+                VALUES (?::UUID, ?, ?::UUID, ?, ?, ?::TIMESTAMP, ?::TIMESTAMP, ?, ?::JSON)
+                ON CONFLICT (from_id, to_id, type) DO UPDATE SET
+                    from_type  = EXCLUDED.from_type,
+                    to_type    = EXCLUDED.to_type,
+                    valid_from = COALESCE(EXCLUDED.valid_from, relations.valid_from),
+                    valid_to   = COALESCE(EXCLUDED.valid_to,   relations.valid_to),
+                    confidence = EXCLUDED.confidence,
+                    source_ids = EXCLUDED.source_ids
+                """,
+                [
+                    from_id, from_type, to_id, to_type, rel,
+                    valid_from, valid_to, confidence,
+                    json.dumps(source_ids or []),
+                ],
             )
             self._refresh_adjacency_cache()
 
@@ -251,85 +691,335 @@ class GraphStore:
             self._conn.execute(stmt)
 
     # ------------------------------------------------------------------
+    # EMBEDDINGS
+    # ------------------------------------------------------------------
+
+    def update_object_embedding(
+        self,
+        object_id: str,
+        object_type: str,
+        embedding: list[float],
+        model: str = "nomic-embed-text",
+    ) -> None:
+        """Store or replace an embedding for any graph object."""
+        if len(embedding) != EMBEDDING_DIM:
+            raise ValueError(
+                f"Embedding must be {EMBEDDING_DIM}-dimensional, got {len(embedding)}"
+            )
+        with self._lock:
+            self._conn.execute(
+                f"""
+                INSERT INTO embeddings (object_id, object_type, vector, model)
+                VALUES (?, ?, ?::FLOAT[{EMBEDDING_DIM}], ?)
+                ON CONFLICT (object_id, object_type) DO UPDATE SET
+                    vector = EXCLUDED.vector,
+                    model  = EXCLUDED.model
+                """,
+                [object_id, object_type, embedding, model],
+            )
+
+    # ------------------------------------------------------------------
     # QUERIES
     # ------------------------------------------------------------------
 
-    def query_neighbors(self, node_name: str, hops: int = 2) -> list[dict]:
-        """
-        Return all nodes reachable from node_name within N hops.
-        Traversal is bidirectional (both in-edges and out-edges followed).
-        """
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT id FROM nodes WHERE name = ?", [node_name.strip()]
-            ).fetchone()
-            if not row:
-                return []
-            node_id = row[0]
-            rows = self._conn.execute(
-                """
-                SELECT n.name, n.label, n.properties, ac.hops
-                  FROM adjacency_cache ac
-                  JOIN nodes n ON ac.neighbor_id = n.id
-                 WHERE ac.node_id = ? AND ac.hops <= ?
-                 ORDER BY ac.hops, n.name
-                """,
-                [node_id, hops],
-            ).fetchall()
-        return [
-            {
-                "name":       r[0],
-                "label":      r[1],
-                "properties": json.loads(r[2]) if r[2] else {},
-                "hops":       r[3],
-            }
-            for r in rows
-        ]
-
     def semantic_search(
-        self, query_embedding: list[float], top_n: int = 10
+        self,
+        query_embedding: list[float],
+        top_n: int = 10,
+        object_types: list[str] | None = None,
     ) -> list[dict]:
         """
-        Return the top_n nodes most similar to query_embedding by cosine
-        similarity. Uses the HNSW index; nodes without an embedding are
-        excluded. Caller must supply a unit-normalised vector for best results.
+        Return top_n objects most similar to query_embedding by cosine similarity.
+        Queries the unified embeddings table; resolves display names via LEFT JOINs.
+        object_types filters by 'entity' | 'event' | 'commitment'.
         """
         if len(query_embedding) != EMBEDDING_DIM:
             raise ValueError(
                 f"Query embedding must be {EMBEDDING_DIM}-dimensional, "
                 f"got {len(query_embedding)}"
             )
+
+        type_filter = ""
+        params: list = [query_embedding, top_n]
+        if object_types:
+            placeholders = ", ".join("?" * len(object_types))
+            type_filter = f"AND emb.object_type IN ({placeholders})"
+            params = [query_embedding] + list(object_types) + [top_n]
+
         with self._lock:
             rows = self._conn.execute(
                 f"""
-                SELECT name, label, properties,
-                       array_cosine_similarity(
-                           embedding, ?::FLOAT[{EMBEDDING_DIM}]
-                       ) AS score
-                  FROM nodes
-                 WHERE embedding IS NOT NULL
-                 ORDER BY score DESC
-                 LIMIT ?
+                SELECT
+                    emb.object_id,
+                    emb.object_type,
+                    COALESCE(e.name, ev.title, c.title, emb.object_id) AS display_name,
+                    COALESCE(e.type,  ev.type,  c.status)              AS subtype,
+                    array_cosine_similarity(
+                        emb.vector, ?::FLOAT[{EMBEDDING_DIM}]
+                    ) AS score
+                FROM embeddings emb
+                LEFT JOIN entities    e  ON emb.object_id = e.id::TEXT
+                                        AND emb.object_type = 'entity'
+                LEFT JOIN events      ev ON emb.object_id = ev.id::TEXT
+                                        AND emb.object_type = 'event'
+                LEFT JOIN commitments c  ON emb.object_id = c.id::TEXT
+                                        AND emb.object_type = 'commitment'
+                WHERE emb.vector IS NOT NULL
+                {type_filter}
+                ORDER BY score DESC
+                LIMIT ?
                 """,
-                [query_embedding, top_n],
+                params,
             ).fetchall()
+
         return [
             {
-                "name":       r[0],
-                "label":      r[1],
-                "properties": json.loads(r[2]) if r[2] else {},
-                "score":      float(r[3]),
+                "object_id":    r[0],
+                "object_type":  r[1],
+                "display_name": r[2],
+                "subtype":      r[3],
+                "score":        float(r[4]),
             }
             for r in rows
         ]
+
+    def _query_neighbors_by_id(
+        self,
+        node_id: str,
+        node_type: str,
+        hops: int = 2,
+    ) -> list[dict]:
+        """
+        Return all objects reachable from (node_id, node_type) within N hops.
+        Traversal is bidirectional via the adjacency cache.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT ac.neighbor_id, ac.neighbor_type, ac.hops,
+                       COALESCE(e.name, ev.title, c.title) AS display_name,
+                       COALESCE(e.type, ev.type, c.status) AS subtype
+                FROM adjacency_cache ac
+                LEFT JOIN entities    e  ON ac.neighbor_id = e.id::TEXT
+                                        AND ac.neighbor_type = 'entity'
+                LEFT JOIN events      ev ON ac.neighbor_id = ev.id::TEXT
+                                        AND ac.neighbor_type = 'event'
+                LEFT JOIN commitments c  ON ac.neighbor_id = c.id::TEXT
+                                        AND ac.neighbor_type = 'commitment'
+                WHERE ac.node_id = ? AND ac.node_type = ? AND ac.hops <= ?
+                ORDER BY ac.hops, display_name
+                """,
+                [node_id, node_type, hops],
+            ).fetchall()
+        return [
+            {
+                "object_id":    r[0],
+                "object_type":  r[1],
+                "hops":         r[2],
+                "display_name": r[3] or r[0],
+                "subtype":      r[4],
+            }
+            for r in rows
+        ]
+
+    def search_by_name(self, fragment: str, limit: int = 5) -> list[dict]:
+        """
+        Case-insensitive substring search across entities, events, and commitments.
+        Returns list of dicts: {object_id, object_type, subtype, display_name}.
+        """
+        pattern = f"%{fragment.strip()}%"
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT id::TEXT, 'entity' AS object_type, type AS subtype, name AS display_name
+                  FROM entities WHERE name ILIKE ?
+                UNION ALL
+                SELECT id::TEXT, 'event', type, title
+                  FROM events WHERE title ILIKE ?
+                UNION ALL
+                SELECT id::TEXT, 'commitment', status, title
+                  FROM commitments WHERE title ILIKE ?
+                LIMIT ?
+                """,
+                [pattern, pattern, pattern, limit],
+            ).fetchall()
+        return [
+            {
+                "object_id":    r[0],
+                "object_type":  r[1],
+                "subtype":      r[2],
+                "display_name": r[3],
+            }
+            for r in rows
+        ]
+
+    def get_active_commitments(
+        self,
+        status_filter: list[str] | None = None,
+    ) -> list[dict]:
+        """
+        Return commitments ordered by due_time.
+        status_filter defaults to ['planned', 'confirmed'].
+        """
+        statuses = status_filter or ["planned", "confirmed"]
+        placeholders = ", ".join("?" * len(statuses))
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT c.id::TEXT, c.title, c.description, c.status, c.priority,
+                       c.due_time, c.owner_id::TEXT, e.name AS owner_name,
+                       c.related_event_id::TEXT
+                  FROM commitments c
+                  LEFT JOIN entities e ON c.owner_id = e.id
+                 WHERE c.status IN ({placeholders})
+                 ORDER BY c.due_time NULLS LAST, c.priority DESC
+                """,
+                statuses,
+            ).fetchall()
+        return [
+            {
+                "id":          r[0],
+                "title":       r[1],
+                "description": r[2],
+                "status":      r[3],
+                "priority":    r[4],
+                "due_time":    str(r[5]) if r[5] else None,
+                "owner_id":    r[6],
+                "owner_name":  r[7],
+                "event_id":    r[8],
+            }
+            for r in rows
+        ]
+
+    def stats(self) -> dict:
+        """Return row counts for all primary tables."""
+        with self._lock:
+            return {
+                "entities":    self._conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0],
+                "events":      self._conn.execute("SELECT COUNT(*) FROM events").fetchone()[0],
+                "commitments": self._conn.execute("SELECT COUNT(*) FROM commitments").fetchone()[0],
+                "relations":   self._conn.execute("SELECT COUNT(*) FROM relations").fetchone()[0],
+                "embeddings":  self._conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0],
+            }
 
     # ------------------------------------------------------------------
     # ASYNC / FIRE-AND-FORGET WRAPPERS
     # ------------------------------------------------------------------
 
+    async def async_upsert_entity(self, *args, **kwargs) -> str:
+        return await asyncio.to_thread(self.upsert_entity, *args, **kwargs)
+
+    async def async_upsert_event(self, *args, **kwargs) -> str:
+        return await asyncio.to_thread(self.upsert_event, *args, **kwargs)
+
+    async def async_upsert_commitment(self, *args, **kwargs) -> str:
+        return await asyncio.to_thread(self.upsert_commitment, *args, **kwargs)
+
+    async def async_add_relation(self, *args, **kwargs) -> None:
+        await asyncio.to_thread(self.add_relation, *args, **kwargs)
+
+    def submit_upsert_entity(self, *args, **kwargs) -> Future:
+        return self._executor.submit(self.upsert_entity, *args, **kwargs)
+
+    def submit_upsert_event(self, *args, **kwargs) -> Future:
+        return self._executor.submit(self.upsert_event, *args, **kwargs)
+
+    def submit_upsert_commitment(self, *args, **kwargs) -> Future:
+        return self._executor.submit(self.upsert_commitment, *args, **kwargs)
+
+    def submit_add_relation(self, *args, **kwargs) -> Future:
+        return self._executor.submit(self.add_relation, *args, **kwargs)
+
+    # ------------------------------------------------------------------
+    # BACKWARD-COMPAT WRAPPERS (legacy upsert_node / add_edge surface)
+    # ------------------------------------------------------------------
+
+    def upsert_node(
+        self,
+        name: str,
+        label: str,
+        properties: dict | None = None,
+    ) -> str:
+        """Legacy wrapper → upsert_entity(). Returns UUID string."""
+        etype = _LABEL_TO_TYPE.get(label.lower().strip(), "concept")
+        return self.upsert_entity(name, etype, attributes=properties)
+
+    def add_edge(
+        self,
+        from_name: str,
+        to_name: str,
+        relationship: str,
+        weight: float = 1.0,
+    ) -> None:
+        """
+        Legacy wrapper → add_relation().
+        Auto-creates stub entities if endpoints are absent.
+        weight maps to confidence.
+        """
+        rel = relationship.lower().strip()
+        rel = _REL_REMAP.get(rel, rel)
+        if rel not in ALLOWED_RELATION_TYPES:
+            raise ValueError(
+                f"Relationship '{rel}' not in controlled vocabulary. "
+                f"Allowed: {sorted(ALLOWED_RELATION_TYPES)}"
+            )
+        from_id = self.upsert_entity(from_name.strip(), "concept")
+        to_id   = self.upsert_entity(to_name.strip(), "concept")
+        self.add_relation(from_id, "entity", to_id, "entity", rel,
+                          confidence=float(weight))
+
+    def update_node_embedding(self, name: str, embedding: list[float]) -> None:
+        """Legacy wrapper → update_object_embedding()."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id FROM entities WHERE name = ?", [name.strip()]
+            ).fetchone()
+        if row:
+            self.update_object_embedding(str(row[0]), "entity", embedding)
+
+    def query_neighbors(self, node_name: str, hops: int = 2) -> list[dict]:
+        """Legacy wrapper → _query_neighbors_by_id(). Assumes entity type."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id FROM entities WHERE name = ?", [node_name.strip()]
+            ).fetchone()
+        if not row:
+            return []
+        neighbors = self._query_neighbors_by_id(str(row[0]), "entity", hops)
+        return [
+            {
+                "name":       n["display_name"],
+                "label":      n["subtype"] or n["object_type"],
+                "properties": {},
+                "hops":       n["hops"],
+            }
+            for n in neighbors
+        ]
+
+    def search_nodes_by_name(self, fragment: str, limit: int = 5) -> list[dict]:
+        """Legacy wrapper → search_by_name(). Returns old-style dicts."""
+        return [
+            {"name": r["display_name"], "label": r["subtype"] or r["object_type"], "properties": {}}
+            for r in self.search_by_name(fragment, limit)
+        ]
+
+    def submit_upsert_node(
+        self, name: str, label: str, properties: dict | None = None
+    ) -> Future:
+        return self._executor.submit(self.upsert_node, name, label, properties)
+
+    def submit_add_edge(
+        self,
+        from_name: str,
+        to_name: str,
+        relationship: str,
+        weight: float = 1.0,
+    ) -> Future:
+        return self._executor.submit(self.add_edge, from_name, to_name, relationship, weight)
+
     async def async_upsert_node(
         self, name: str, label: str, properties: dict | None = None
-    ) -> int:
+    ) -> str:
         return await asyncio.to_thread(self.upsert_node, name, label, properties)
 
     async def async_add_edge(
@@ -340,54 +1030,6 @@ class GraphStore:
         weight: float = 1.0,
     ) -> None:
         await asyncio.to_thread(self.add_edge, from_name, to_name, relationship, weight)
-
-    def submit_upsert_node(
-        self, name: str, label: str, properties: dict | None = None
-    ) -> Future:
-        """
-        Non-blocking upsert for use in voice_pipeline.py.
-        Returns a Future; callers can ignore it or call .result() to wait.
-        """
-        return self._executor.submit(self.upsert_node, name, label, properties)
-
-    def submit_add_edge(
-        self,
-        from_name: str,
-        to_name: str,
-        relationship: str,
-        weight: float = 1.0,
-    ) -> Future:
-        return self._executor.submit(
-            self.add_edge, from_name, to_name, relationship, weight
-        )
-
-    # ------------------------------------------------------------------
-    # UTILITY QUERIES
-    # ------------------------------------------------------------------
-
-    def stats(self) -> tuple[int, int]:
-        """Return (node_count, edge_count) for the live graph growth counter."""
-        with self._lock:
-            n = self._conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
-            e = self._conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
-        return int(n), int(e)
-
-    def search_nodes_by_name(self, fragment: str, limit: int = 5) -> list[dict]:
-        """Case-insensitive substring search over node names."""
-        pattern = f"%{fragment.strip()}%"
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT name, label, properties FROM nodes WHERE name ILIKE ? LIMIT ?",
-                [pattern, limit],
-            ).fetchall()
-        return [
-            {
-                "name":       r[0],
-                "label":      r[1],
-                "properties": json.loads(r[2]) if r[2] else {},
-            }
-            for r in rows
-        ]
 
     # ------------------------------------------------------------------
     # LIFECYCLE
@@ -429,35 +1071,65 @@ if __name__ == "__main__":
 
     with GraphStore(db_path=test_db) as gs:
 
-        # ── nodes & deduplication ──────────────────────────────────────
-        id_marie  = gs.upsert_node("Marie Curie", "Person", {"occupation": "physicist"})
-        id_paris  = gs.upsert_node("Paris",       "Place",  {"country": "France"})
-        id_radium = gs.upsert_node("Radium",      "Concept", {"type": "element"})
+        # ── entities ──────────────────────────────────────────────────
+        id_boris  = gs.upsert_entity("Boris",  "person",  attributes={"city": "London"})
+        id_london = gs.upsert_entity("London", "place")
+        id_lyon   = gs.upsert_entity("Lyon",   "place")
+        id_desk   = gs.upsert_entity("Desk",   "object")
 
-        id_marie2 = gs.upsert_node("Marie Curie", "Person", {"occupation": "chemist"})
-        check(id_marie == id_marie2,          "dedup: second upsert preserves id")
+        id_boris2 = gs.upsert_entity("Boris", "person", attributes={"city": "Paris"})
+        check(id_boris == id_boris2, "entity dedup: same UUID on second upsert")
 
         row = gs._conn.execute(
-            "SELECT properties FROM nodes WHERE name = 'Marie Curie'"
+            "SELECT attributes FROM entities WHERE name = 'Boris'"
         ).fetchone()
-        props = json.loads(row[0])
-        check(props.get("occupation") == "chemist", "dedup: properties updated on conflict")
+        attrs = json.loads(row[0])
+        check(attrs.get("city") == "Paris", "entity dedup: attributes updated on conflict")
 
-        # ── edges & adjacency cache ────────────────────────────────────
-        gs.add_edge("Marie Curie", "Paris",  "lives_in",  weight=0.9)
-        gs.add_edge("Marie Curie", "Radium", "created_by",weight=1.0)
-        gs.add_edge("Radium",      "Paris",  "related_to",weight=0.5)
+        # ── events ────────────────────────────────────────────────────
+        id_delivery = gs.upsert_event(
+            "Desk delivery Mar 23",
+            "delivery",
+            description="IKEA desk delivered to Jarente flat",
+            start_time="2025-03-23 09:00:00",
+            participants=[id_boris],
+            location_id=id_lyon,
+        )
+        check(id_delivery is not None, "event upserted")
 
-        n1 = gs.query_neighbors("Marie Curie", hops=1)
-        check(len(n1) == 2,  f"1-hop neighbours of Marie Curie: expected 2, got {len(n1)}")
+        id_delivery2 = gs.upsert_event("Desk delivery Mar 23", "delivery")
+        check(id_delivery == id_delivery2, "event dedup: same UUID on second upsert")
 
-        n2 = gs.query_neighbors("Marie Curie", hops=2)
-        check(len(n2) >= 2,  f"2-hop neighbours of Marie Curie: expected ≥2, got {len(n2)}")
+        # ── commitments ───────────────────────────────────────────────
+        id_c = gs.upsert_commitment(
+            "Be present for desk delivery",
+            owner_id=id_boris,
+            related_event_id=id_delivery,
+            due_time="2025-03-23 09:00:00",
+            status="planned",
+            priority="high",
+        )
+        check(id_c is not None, "commitment upserted")
 
-        n_paris = gs.query_neighbors("Paris", hops=1)
-        check(len(n_paris) >= 2, f"Paris 1-hop (bidirectional): expected ≥2, got {len(n_paris)}")
+        active = gs.get_active_commitments()
+        check(len(active) >= 1, f"get_active_commitments returns ≥1, got {len(active)}")
+        check(active[0]["priority"] == "high", "commitment priority correct")
 
-        # ── embeddings & semantic search ───────────────────────────────
+        # ── relations ─────────────────────────────────────────────────
+        gs.add_relation(id_boris, "entity", id_london, "entity", "lives_in")
+        gs.add_relation(id_boris, "entity", id_delivery, "event", "participates_in")
+        gs.add_relation(id_boris, "entity", id_c, "commitment", "owns_commitment")
+
+        nb1 = gs._query_neighbors_by_id(id_boris, "entity", hops=1)
+        check(len(nb1) >= 2, f"1-hop neighbors of Boris: expected ≥2, got {len(nb1)}")
+
+        # ── search_by_name (cross-type) ───────────────────────────────
+        hits = gs.search_by_name("desk", limit=10)
+        hit_types = {h["object_type"] for h in hits}
+        check("event" in hit_types or "entity" in hit_types,
+              "search_by_name finds cross-type results")
+
+        # ── embeddings & semantic_search ──────────────────────────────
         rng = random.Random(42)
 
         def rand_unit_vec() -> list[float]:
@@ -465,32 +1137,50 @@ if __name__ == "__main__":
             mag = sum(x ** 2 for x in v) ** 0.5
             return [x / mag for x in v]
 
-        for nm in ("Marie Curie", "Paris", "Radium"):
-            gs.update_node_embedding(nm, rand_unit_vec())
+        for oid, otype in [(id_boris, "entity"), (id_london, "entity"),
+                           (id_delivery, "event"), (id_c, "commitment")]:
+            gs.update_object_embedding(oid, otype, rand_unit_vec())
 
-        results = gs.semantic_search(rand_unit_vec(), top_n=3)
-        check(len(results) == 3,            "semantic_search returns 3 results")
-        check(all("score" in r for r in results), "semantic_search results have scores")
+        results = gs.semantic_search(rand_unit_vec(), top_n=4)
+        check(len(results) == 4, f"semantic_search returns 4 results, got {len(results)}")
         check(results[0]["score"] >= results[-1]["score"], "results ordered by score desc")
+        result_types = {r["object_type"] for r in results}
+        check(len(result_types) > 1, "semantic_search spans multiple object types")
 
-        # ── HNSW index exists in catalogue ────────────────────────────
+        # ── HNSW index exists ─────────────────────────────────────────
         idx_row = gs._conn.execute(
-            "SELECT index_name FROM duckdb_indexes() WHERE index_name = 'nodes_embedding_hnsw'"
+            "SELECT index_name FROM duckdb_indexes() "
+            "WHERE index_name = 'embeddings_vector_hnsw'"
         ).fetchone()
-        check(idx_row is not None, "HNSW index exists in duckdb_indexes()")
+        check(idx_row is not None, "HNSW index on embeddings table exists")
 
-        # ── fire-and-forget ───────────────────────────────────────────
-        f = gs.submit_upsert_node("London", "Place", {})
-        f.result()  # wait in test context
-        row = gs._conn.execute("SELECT id FROM nodes WHERE name = 'London'").fetchone()
-        check(row is not None, "fire-and-forget upsert: London inserted")
+        # ── stats ─────────────────────────────────────────────────────
+        s = gs.stats()
+        check(s["entities"] >= 4,    f"stats: entities ≥4, got {s['entities']}")
+        check(s["events"] >= 1,      f"stats: events ≥1, got {s['events']}")
+        check(s["commitments"] >= 1, f"stats: commitments ≥1, got {s['commitments']}")
+        check(s["relations"] >= 3,   f"stats: relations ≥3, got {s['relations']}")
+        check(s["embeddings"] >= 4,  f"stats: embeddings ≥4, got {s['embeddings']}")
 
-        # ── bad relationship is rejected ──────────────────────────────
+        # ── backward-compat wrappers ──────────────────────────────────
+        id_compat = gs.upsert_node("Ada Lovelace", "Person", {"field": "maths"})
+        check(id_compat is not None, "upsert_node backward-compat wrapper works")
+
+        gs.add_edge("Ada Lovelace", "London", "lives_in", weight=0.8)
+        nb_compat = gs.query_neighbors("Ada Lovelace", hops=1)
+        check(len(nb_compat) >= 1, "query_neighbors backward-compat wrapper works")
+
         try:
-            gs.add_edge("Marie Curie", "London", "invented", weight=1.0)
+            gs.add_edge("Boris", "London", "invented", weight=1.0)
             check(False, "ValueError raised for unknown relationship")
         except ValueError:
             check(True, "ValueError raised for unknown relationship")
+
+        # ── fire-and-forget ───────────────────────────────────────────
+        f = gs.submit_upsert_entity("Lyon", "place")
+        f.result()
+        row = gs._conn.execute("SELECT id FROM entities WHERE name = 'Lyon'").fetchone()
+        check(row is not None, "fire-and-forget submit_upsert_entity works")
 
     test_db.unlink(missing_ok=True)
 

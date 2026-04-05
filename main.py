@@ -8,7 +8,7 @@ Start-up sequence:
 
 Voice loop (per turn):
   a. Record mic → Whisper STT → transcript
-  b. Build graph context (HNSW semantic search + name search + neighbors)
+  b. Build graph context (semantic search + name search + neighbors)
   c. Call qwen3:30b with tool schemas (stream, think=False)
   d. Parse tool calls → async graph writes + background embedding jobs
   e. Print live graph growth counter
@@ -34,7 +34,15 @@ import ollama
 import requests
 import sounddevice as sd
 
-from graph_store import GraphStore, ALLOWED_RELATIONSHIPS
+from graph_store import (
+    GraphStore,
+    ALLOWED_RELATION_TYPES,
+    ALLOWED_RELATIONSHIPS,
+    ENTITY_TYPES,
+    EVENT_TYPES,
+    COMMITMENT_STATUSES,
+    COMMITMENT_PRIORITIES,
+)
 from voice_pipeline import (
     check_prerequisites,
     record_until_silence,
@@ -60,7 +68,7 @@ EMBED_MODEL   = "nomic-embed-text"
 EMBED_DIM     = int(os.getenv("LM_EMBEDDING_DIM", "768"))
 
 # How many graph context lines to inject into the system prompt
-CONTEXT_LINES = 20
+CONTEXT_LINES = 24
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 log = logging.getLogger("main")
@@ -69,55 +77,192 @@ log = logging.getLogger("main")
 # TOOL SCHEMAS
 # ---------------------------------------------------------------------------
 
-UPSERT_NODE_TOOL = {
+UPSERT_ENTITY_TOOL = {
     "type": "function",
     "function": {
-        "name": "upsert_node",
+        "name": "upsert_entity",
         "description": (
             "Store or update a named entity in the knowledge graph. "
-            "Call once per distinct entity mentioned."
+            "Call once per distinct person, place, org, object, or concept mentioned."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "name":  {"type": "string",  "description": "Canonical entity name"},
-                "label": {"type": "string",  "description": "Entity type, e.g. Person, Place, Concept, Event, Organisation"},
-                "props": {"type": "object",  "description": "Optional key/value attributes"},
+                "name": {
+                    "type": "string",
+                    "description": "Canonical entity name, e.g. 'Boris', 'Lyon', 'IKEA'",
+                },
+                "type": {
+                    "type": "string",
+                    "enum": sorted(ENTITY_TYPES),
+                    "description": "Entity type",
+                },
+                "attributes": {
+                    "type": "object",
+                    "description": "Optional key/value attributes, e.g. {\"occupation\": \"architect\"}",
+                },
+                "aliases": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Alternative names or abbreviations",
+                },
             },
-            "required": ["name", "label"],
+            "required": ["name", "type"],
         },
     },
 }
 
-ADD_EDGE_TOOL = {
+UPSERT_EVENT_TOOL = {
     "type": "function",
     "function": {
-        "name": "add_edge",
+        "name": "upsert_event",
         "description": (
-            "Record a relationship between two entities. "
-            f"relationship must be one of: {', '.join(sorted(ALLOWED_RELATIONSHIPS))}."
+            "Record an event that happened or is planned to happen. "
+            "Use for deliveries, meetings, conversations, transactions, or state changes."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "from_name":     {"type": "string"},
-                "to_name":       {"type": "string"},
-                "relationship":  {"type": "string", "enum": sorted(ALLOWED_RELATIONSHIPS)},
-                "weight":        {"type": "number", "default": 1.0},
+                "title": {
+                    "type": "string",
+                    "description": "Short descriptive title, e.g. 'Desk delivery Mar 23'",
+                },
+                "type": {
+                    "type": "string",
+                    "enum": sorted(EVENT_TYPES),
+                    "description": "Event type",
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Optional longer description",
+                },
+                "start_time": {
+                    "type": "string",
+                    "description": "ISO-8601 datetime, e.g. '2025-03-23T09:00:00'. Null if unknown.",
+                },
+                "end_time": {
+                    "type": "string",
+                    "description": "ISO-8601 datetime. Null if unknown or open-ended.",
+                },
+                "participants": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Names of entities involved",
+                },
+                "location": {
+                    "type": "string",
+                    "description": "Name of the location entity",
+                },
             },
-            "required": ["from_name", "to_name", "relationship"],
+            "required": ["title", "type"],
         },
     },
 }
 
-TOOLS = [UPSERT_NODE_TOOL, ADD_EDGE_TOOL]
+UPSERT_COMMITMENT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "upsert_commitment",
+        "description": (
+            "Record a commitment, obligation, or task. "
+            "Use when someone has to do something by a certain time."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "Short description of the obligation, e.g. 'Be present for desk delivery'",
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Optional longer explanation",
+                },
+                "owner": {
+                    "type": "string",
+                    "description": "Name of the entity responsible",
+                },
+                "due_time": {
+                    "type": "string",
+                    "description": "ISO-8601 deadline. Null if unspecified.",
+                },
+                "status": {
+                    "type": "string",
+                    "enum": sorted(COMMITMENT_STATUSES),
+                    "description": "Current status",
+                },
+                "priority": {
+                    "type": "string",
+                    "enum": sorted(COMMITMENT_PRIORITIES),
+                    "description": "Importance level",
+                },
+                "related_event_title": {
+                    "type": "string",
+                    "description": "Title of the related event, if any",
+                },
+            },
+            "required": ["title"],
+        },
+    },
+}
+
+ADD_RELATION_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "add_relation",
+        "description": (
+            "Record a typed relationship between two graph objects. "
+            f"type must be one of: {', '.join(sorted(ALLOWED_RELATION_TYPES))}."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "from_name": {
+                    "type": "string",
+                    "description": "Name or title of the source object",
+                },
+                "from_object_type": {
+                    "type": "string",
+                    "enum": ["entity", "event", "commitment"],
+                    "description": "Graph type of the source object",
+                },
+                "to_name": {
+                    "type": "string",
+                    "description": "Name or title of the target object",
+                },
+                "to_object_type": {
+                    "type": "string",
+                    "enum": ["entity", "event", "commitment"],
+                    "description": "Graph type of the target object",
+                },
+                "type": {
+                    "type": "string",
+                    "enum": sorted(ALLOWED_RELATION_TYPES),
+                    "description": "Relationship type",
+                },
+                "valid_from": {
+                    "type": "string",
+                    "description": "ISO-8601 datetime when this relation became true. Null if unknown.",
+                },
+                "valid_to": {
+                    "type": "string",
+                    "description": "ISO-8601 datetime when this relation ceased to be true. Null if ongoing.",
+                },
+            },
+            "required": ["from_name", "from_object_type", "to_name", "to_object_type", "type"],
+        },
+    },
+}
+
+TOOLS = [UPSERT_ENTITY_TOOL, UPSERT_EVENT_TOOL, UPSERT_COMMITMENT_TOOL, ADD_RELATION_TOOL]
 
 SYSTEM_PROMPT_BASE = (
     "You are a helpful voice assistant with a persistent memory.\n"
     "Respond concisely in plain spoken language. "
     "Do not use markdown, bullet points, or special characters.\n"
-    "After your spoken reply, call upsert_node and add_edge for every "
-    "entity and relationship you learned this turn.\n"
+    "After your spoken reply, call upsert_entity, upsert_event, upsert_commitment, "
+    "and add_relation for every entity, event, commitment, and relationship you "
+    "learned this turn. Use ISO-8601 dates wherever times are mentioned.\n"
 )
 
 # ---------------------------------------------------------------------------
@@ -186,7 +331,7 @@ def ensure_kokoro_server() -> None:
     subprocess.Popen(
         [PYTHON_EXE, KOKORO_SCRIPT],
         stdout=subprocess.DEVNULL,
-        stderr=sys.stderr,   # surface model-load errors
+        stderr=sys.stderr,
     )
     deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
@@ -224,41 +369,65 @@ def _build_context(
     """
     Build up to CONTEXT_LINES lines of graph context to inject into the prompt.
     Strategy:
-      1. HNSW semantic search on transcript embedding (if available)
-      2. Text keyword search on first word of transcript
+      1. HNSW semantic search across all object types (entities, events, commitments)
+      2. Cross-type name keyword search on first meaningful word
       3. 1-hop neighbors of top hit
-    Deduplicates by name; truncates at CONTEXT_LINES.
+      4. Active commitments (always included, up to 3)
+    Deduplicates by object_id; truncates at CONTEXT_LINES.
     """
-    seen: set[str] = set()
+    seen_ids: set[str] = set()
     lines: list[str] = []
 
-    def _add(name: str, label: str, extra: str = "") -> None:
-        if name in seen or len(lines) >= CONTEXT_LINES:
+    def _add(object_id: str, object_type: str, subtype: str, display_name: str,
+             extra: str = "") -> None:
+        if object_id in seen_ids or len(lines) >= CONTEXT_LINES:
             return
-        seen.add(name)
-        entry = f"[{label}] {name}"
+        seen_ids.add(object_id)
+        entry = f"[{object_type}:{subtype}] {display_name}"
         if extra:
             entry += f" — {extra}"
         lines.append(entry)
 
-    # 1. Semantic search
+    # 1. Semantic search across all types
     if embed_available:
         emb = _get_embedding(client, transcript)
         if emb:
             for hit in gs.semantic_search(emb, top_n=8):
-                _add(hit["name"], hit["label"])
+                _add(hit["object_id"], hit["object_type"],
+                     hit["subtype"] or "", hit["display_name"])
 
-    # 2. Name keyword search using first meaningful word
+    # 2. Cross-type name search using first meaningful word
     words = [w for w in transcript.split() if len(w) > 3]
     if words:
-        for hit in gs.search_nodes_by_name(words[0], limit=5):
-            _add(hit["name"], hit["label"])
+        for hit in gs.search_by_name(words[0], limit=5):
+            _add(hit["object_id"], hit["object_type"],
+                 hit["subtype"] or "", hit["display_name"])
 
-    # 3. Expand neighbors of first match
-    if seen:
-        anchor = next(iter(seen))
-        for nb in gs.query_neighbors(anchor, hops=1):
-            _add(nb["name"], nb["label"], f"{nb['hops']}-hop")
+    # 3. Expand neighbors of first semantic/name hit
+    if seen_ids:
+        first_id = next(iter(seen_ids))
+        # Determine type of first hit by checking which table it's in
+        first_type = "entity"
+        with gs._lock:
+            if gs._conn.execute(
+                "SELECT 1 FROM events WHERE id::TEXT = ?", [first_id]
+            ).fetchone():
+                first_type = "event"
+            elif gs._conn.execute(
+                "SELECT 1 FROM commitments WHERE id::TEXT = ?", [first_id]
+            ).fetchone():
+                first_type = "commitment"
+        for nb in gs._query_neighbors_by_id(first_id, first_type, hops=1):
+            _add(nb["object_id"], nb["object_type"],
+                 nb["subtype"] or "", nb["display_name"],
+                 f"{nb['hops']}-hop")
+
+    # 4. Active commitments — always inject up to 3
+    if len(lines) < CONTEXT_LINES:
+        for c in gs.get_active_commitments()[:3]:
+            due = f"due {c['due_time']}" if c["due_time"] else "no deadline"
+            _add(c["id"], "commitment", c["status"], c["title"],
+                 f"{c['priority']} priority, {due}")
 
     if not lines:
         return ""
@@ -321,7 +490,6 @@ def _stream_response_and_collect_tools(
     for chunk in stream:
         msg = chunk.message
 
-        # Accumulate tool calls (delivered in the final chunk)
         if msg.tool_calls:
             for tc in msg.tool_calls:
                 tool_calls.append({
@@ -340,7 +508,6 @@ def _stream_response_and_collect_tools(
         if chunk.done:
             break
 
-    # Flush trailing fragment
     if sentence_buffer.strip():
         _tts_play(sentence_buffer)
 
@@ -351,6 +518,33 @@ def _stream_response_and_collect_tools(
 # TOOL CALL APPLICATION
 # ---------------------------------------------------------------------------
 
+def _resolve_object_id(
+    gs: GraphStore,
+    name: str,
+    object_type: str,
+) -> str | None:
+    """
+    Resolve a name/title to a UUID string for the given object type.
+    Returns None if not found.
+    """
+    with gs._lock:
+        if object_type == "entity":
+            row = gs._conn.execute(
+                "SELECT id FROM entities WHERE name = ?", [name.strip()]
+            ).fetchone()
+        elif object_type == "event":
+            row = gs._conn.execute(
+                "SELECT id FROM events WHERE title = ?", [name.strip()]
+            ).fetchone()
+        elif object_type == "commitment":
+            row = gs._conn.execute(
+                "SELECT id FROM commitments WHERE title = ?", [name.strip()]
+            ).fetchone()
+        else:
+            return None
+    return str(row[0]) if row else None
+
+
 def _apply_tool_calls(
     gs: GraphStore,
     tool_calls: list[dict],
@@ -359,23 +553,132 @@ def _apply_tool_calls(
     embed_available: bool,
 ) -> None:
     """
-    Execute graph writes fire-and-forget; schedule background embedding jobs
-    for any newly upserted nodes.
+    Execute graph writes fire-and-forget.
+    Schedule background embedding jobs for newly upserted objects.
+    Handles all 4 tool names (upsert_entity, upsert_event, upsert_commitment,
+    add_relation) plus legacy upsert_node / add_edge for robustness.
     """
-    upserted_names: list[str] = []
+    upserted: list[tuple[str, str]] = []  # (object_id, object_type)
 
     for tc in tool_calls:
         name = tc["name"]
         args = tc["arguments"]
 
-        if name == "upsert_node":
+        # ── upsert_entity ──────────────────────────────────────────────
+        if name == "upsert_entity":
+            ename = args.get("name", "").strip()
+            etype = args.get("type", "concept").strip()
+            if ename:
+                f = gs.submit_upsert_entity(
+                    ename, etype,
+                    aliases=args.get("aliases"),
+                    attributes=args.get("attributes"),
+                )
+                try:
+                    eid = f.result()
+                    upserted.append((eid, "entity"))
+                except Exception as exc:
+                    log.warning("upsert_entity failed: %s", exc)
+
+        # ── upsert_event ──────────────────────────────────────────────
+        elif name == "upsert_event":
+            etitle = args.get("title", "").strip()
+            etype  = args.get("type", "state_change").strip()
+            if etitle:
+                # Resolve participant names → entity UUIDs
+                participant_ids: list[str] = []
+                for pname in (args.get("participants") or []):
+                    pid = _resolve_object_id(gs, pname, "entity")
+                    if pid:
+                        participant_ids.append(pid)
+
+                # Resolve location name → entity UUID
+                loc_id: str | None = None
+                if args.get("location"):
+                    loc_id = _resolve_object_id(gs, args["location"], "entity")
+
+                f = gs.submit_upsert_event(
+                    etitle, etype,
+                    description=args.get("description"),
+                    start_time=args.get("start_time"),
+                    end_time=args.get("end_time"),
+                    participants=participant_ids,
+                    location_id=loc_id,
+                )
+                try:
+                    eid = f.result()
+                    upserted.append((eid, "event"))
+                except Exception as exc:
+                    log.warning("upsert_event failed: %s", exc)
+
+        # ── upsert_commitment ─────────────────────────────────────────
+        elif name == "upsert_commitment":
+            ctitle = args.get("title", "").strip()
+            if ctitle:
+                owner_id: str | None = None
+                if args.get("owner"):
+                    owner_id = _resolve_object_id(gs, args["owner"], "entity")
+
+                event_id: str | None = None
+                if args.get("related_event_title"):
+                    event_id = _resolve_object_id(
+                        gs, args["related_event_title"], "event"
+                    )
+
+                f = gs.submit_upsert_commitment(
+                    ctitle,
+                    description=args.get("description"),
+                    owner_id=owner_id,
+                    related_event_id=event_id,
+                    due_time=args.get("due_time"),
+                    status=args.get("status", "planned"),
+                    priority=args.get("priority", "medium"),
+                )
+                try:
+                    cid = f.result()
+                    upserted.append((cid, "commitment"))
+                except Exception as exc:
+                    log.warning("upsert_commitment failed: %s", exc)
+
+        # ── add_relation ──────────────────────────────────────────────
+        elif name == "add_relation":
+            from_name = args.get("from_name", "").strip()
+            from_otype = args.get("from_object_type", "entity").strip()
+            to_name   = args.get("to_name", "").strip()
+            to_otype  = args.get("to_object_type", "entity").strip()
+            rel_type  = args.get("type", "").strip()
+
+            if from_name and to_name and rel_type:
+                from_id = _resolve_object_id(gs, from_name, from_otype)
+                to_id   = _resolve_object_id(gs, to_name, to_otype)
+                if from_id and to_id:
+                    gs.submit_add_relation(
+                        from_id, from_otype,
+                        to_id,   to_otype,
+                        rel_type,
+                        valid_from=args.get("valid_from"),
+                        valid_to=args.get("valid_to"),
+                    )
+                else:
+                    log.warning(
+                        "add_relation: could not resolve '%s' (%s) or '%s' (%s)",
+                        from_name, from_otype, to_name, to_otype,
+                    )
+
+        # ── legacy upsert_node ────────────────────────────────────────
+        elif name == "upsert_node":
             node_name  = args.get("name", "").strip()
             node_label = args.get("label", "Unknown").strip()
             props      = args.get("props") or {}
             if node_name:
-                gs.submit_upsert_node(node_name, node_label, props)
-                upserted_names.append(node_name)
+                f = gs.submit_upsert_node(node_name, node_label, props)
+                try:
+                    eid = f.result()
+                    upserted.append((eid, "entity"))
+                except Exception as exc:
+                    log.warning("upsert_node (legacy) failed: %s", exc)
 
+        # ── legacy add_edge ───────────────────────────────────────────
         elif name == "add_edge":
             from_n = args.get("from_name", "").strip()
             to_n   = args.get("to_name", "").strip()
@@ -384,15 +687,32 @@ def _apply_tool_calls(
             if from_n and to_n and rel:
                 gs.submit_add_edge(from_n, to_n, rel, weight)
 
-    # Background embedding: runs after audio has played, no voice impact
-    if embed_available and upserted_names:
-        def _embed_and_store(node_name: str) -> None:
-            emb = _get_embedding(client, node_name)
+    # Background embedding: fires after audio has played, no voice impact
+    if embed_available and upserted:
+        def _embed_and_store(object_id: str, object_type: str, display_name: str) -> None:
+            emb = _get_embedding(client, display_name)
             if emb:
-                gs.update_node_embedding(node_name, emb)
+                gs.update_object_embedding(object_id, object_type, emb)
 
-        for nm in upserted_names:
-            embed_executor.submit(_embed_and_store, nm)
+        for oid, otype in upserted:
+            # Resolve display name for embedding text
+            with gs._lock:
+                if otype == "entity":
+                    row = gs._conn.execute(
+                        "SELECT name FROM entities WHERE id::TEXT = ?", [oid]
+                    ).fetchone()
+                elif otype == "event":
+                    row = gs._conn.execute(
+                        "SELECT title FROM events WHERE id::TEXT = ?", [oid]
+                    ).fetchone()
+                elif otype == "commitment":
+                    row = gs._conn.execute(
+                        "SELECT title FROM commitments WHERE id::TEXT = ?", [oid]
+                    ).fetchone()
+                else:
+                    row = None
+            if row:
+                embed_executor.submit(_embed_and_store, oid, otype, row[0])
 
 
 # ---------------------------------------------------------------------------
@@ -415,10 +735,13 @@ def main() -> None:
     # 3. Kokoro TTS server
     ensure_kokoro_server()
 
-    # Graph store
+    # Graph store (auto-migrates legacy schema on first run)
     gs = GraphStore()
-    nodes0, edges0 = gs.stats()
-    log.info("Graph loaded: %d nodes, %d edges", nodes0, edges0)
+    s0 = gs.stats()
+    log.info(
+        "Graph loaded: %d entities, %d events, %d commitments, %d relations",
+        s0["entities"], s0["events"], s0["commitments"], s0["relations"],
+    )
 
     # Background thread for embedding jobs (single worker, non-blocking)
     embed_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="embedder")
@@ -435,7 +758,7 @@ def main() -> None:
                 log.info("No audio captured — skipping turn")
                 continue
 
-            # --- Stage 2: transcribe (Whisper exits before Ollama loads) ---
+            # --- Stage 2: transcribe ---
             transcript = transcribe(audio)
             if not transcript:
                 log.info("Empty transcript — skipping turn")
@@ -445,7 +768,6 @@ def main() -> None:
             # --- Stage 3: build graph context ---
             context = _build_context(gs, client, transcript, embed_available)
 
-            # Build messages
             system_content = SYSTEM_PROMPT_BASE
             if context:
                 system_content += "\n\n" + context
@@ -458,21 +780,18 @@ def main() -> None:
             response_text, tool_calls = _stream_response_and_collect_tools(client, messages)
             log.info("Assistant: %s", response_text)
 
-            # Maintain rolling conversation history (system prompt rebuilt each turn)
             conversation.append({"role": "user",      "content": transcript})
             conversation.append({"role": "assistant", "content": response_text})
 
-            # --- Stage 5: async graph writes + background embeddings ---
+            # --- Stage 5: graph writes + background embeddings ---
             if tool_calls:
                 _apply_tool_calls(gs, tool_calls, embed_executor, client, embed_available)
 
             # --- Stage 6: graph growth counter ---
-            nodes_now, edges_now = gs.stats()
-            delta_n = nodes_now - nodes0
-            delta_e = edges_now - edges0
+            s = gs.stats()
             print(
-                f"  Graph: {nodes_now} nodes (+{delta_n}), "
-                f"{edges_now} edges (+{delta_e})"
+                f"  Graph: {s['entities']} entities, {s['events']} events, "
+                f"{s['commitments']} commitments, {s['relations']} relations"
             )
 
     except KeyboardInterrupt:
