@@ -25,6 +25,7 @@ import os
 import pathlib
 import subprocess
 import sys
+import threading
 import time
 import wave
 from concurrent.futures import ThreadPoolExecutor
@@ -33,6 +34,8 @@ import numpy as np
 import ollama
 import requests
 import sounddevice as sd
+
+import viz_server
 
 from graph_store import (
     GraphStore,
@@ -254,7 +257,139 @@ ADD_RELATION_TOOL = {
     },
 }
 
-TOOLS = [UPSERT_ENTITY_TOOL, UPSERT_EVENT_TOOL, UPSERT_COMMITMENT_TOOL, ADD_RELATION_TOOL]
+DELETE_ENTITY_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "delete_entity",
+        "description": (
+            "Permanently delete a named entity from the knowledge graph, "
+            "removing all its relations and embeddings. "
+            "Use only when explicitly asked to forget or remove an entity."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Exact name of the entity to delete, e.g. 'Boris', 'Lyon'",
+                },
+            },
+            "required": ["name"],
+        },
+    },
+}
+
+TOOLS = [UPSERT_ENTITY_TOOL, UPSERT_EVENT_TOOL, UPSERT_COMMITMENT_TOOL,
+         ADD_RELATION_TOOL, DELETE_ENTITY_TOOL]
+
+# ---------------------------------------------------------------------------
+# BROWSER CHAT HANDLER
+# ---------------------------------------------------------------------------
+
+_chat_lock = threading.Lock()
+
+
+def make_chat_handler(
+    client: ollama.Client,
+    gs: GraphStore,
+    conversation: list[dict],
+    embed_available: bool,
+    embed_executor: ThreadPoolExecutor,
+):
+    """
+    Return a generator function: handle(message) → yields SSE-formatted strings.
+    Called by viz_server for each POST /chat request.
+    """
+
+    def handle(message: str):
+        actual = message.strip()
+
+        # ── Voice mode ("/v") ─────────────────────────────────────────────────
+        if actual == "/v":
+            yield f"data: {json.dumps({'type': 'status', 'text': 'Listening…'})}\n\n"
+            try:
+                audio = record_until_silence()
+            except Exception as exc:
+                yield f"data: {json.dumps({'type': 'error', 'text': f'Mic error: {exc}'})}\n\n"
+                yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                return
+            if audio.size == 0:
+                yield f"data: {json.dumps({'type': 'status', 'text': 'No audio captured.'})}\n\n"
+                yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                return
+            yield f"data: {json.dumps({'type': 'status', 'text': 'Transcribing…'})}\n\n"
+            actual = transcribe(audio)
+            if not actual:
+                yield f"data: {json.dumps({'type': 'status', 'text': 'Nothing transcribed.'})}\n\n"
+                yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                return
+            log.info("[voice] %s", actual)
+            yield f"data: {json.dumps({'type': 'transcript', 'text': actual})}\n\n"
+
+        # ── LLM turn ──────────────────────────────────────────────────────────
+        with _chat_lock:
+            context = _build_context(gs, client, actual, embed_available)
+            system  = SYSTEM_PROMPT_BASE
+            if context:
+                system += "\n\n" + context
+
+            msgs = [{"role": "system", "content": system}]
+            msgs.extend(conversation)
+            msgs.append({"role": "user", "content": actual})
+
+            full_response: str = ""
+            collected_tools: list[dict] = []
+
+            try:
+                stream = client.chat(
+                    model=OLLAMA_MODEL,
+                    messages=msgs,
+                    tools=TOOLS,
+                    stream=True,
+                    options={"think": False},
+                    keep_alive=OLLAMA_KEEP_ALIVE,
+                )
+
+                for chunk in stream:
+                    msg = chunk.message
+                    if msg.tool_calls:
+                        for tc in msg.tool_calls:
+                            collected_tools.append({
+                                "name":      tc.function.name,
+                                "arguments": tc.function.arguments or {},
+                            })
+
+                    fragment = msg.content or ""
+                    full_response += fragment
+                    if fragment:
+                        yield f"data: {json.dumps({'type': 'token', 'text': fragment})}\n\n"
+
+                    if chunk.done:
+                        break
+
+                conversation.append({"role": "user",      "content": actual})
+                conversation.append({"role": "assistant", "content": full_response})
+                log.info("Chat: %s → %s…", actual[:60], full_response[:80])
+
+                if collected_tools:
+                    _apply_tool_calls(
+                        gs, collected_tools, embed_executor, client, embed_available
+                    )
+                    for tc in collected_tools:
+                        args  = tc["arguments"]
+                        label = (
+                            args.get("name") or args.get("title") or tc["name"]
+                        ).strip()
+                        yield f"data: {json.dumps({'type': 'tool', 'fn': tc['name'], 'label': label})}\n\n"
+
+            except Exception as exc:
+                log.warning("Chat error: %s", exc)
+                yield f"data: {json.dumps({'type': 'error', 'text': str(exc)})}\n\n"
+
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+    return handle
+
 
 SYSTEM_PROMPT_BASE = (
     "You are a helpful voice assistant with a persistent memory.\n"
@@ -468,10 +603,12 @@ def _tts_play(sentence: str) -> None:
 def _stream_response_and_collect_tools(
     client: ollama.Client,
     messages: list[dict],
+    speak: bool = True,
 ) -> tuple[str, list[dict]]:
     """
     Stream qwen3:30b with tools and think=False.
-    Synthesise and play each complete sentence as it arrives.
+    When speak=True: synthesise and play each complete sentence via TTS.
+    When speak=False: stream tokens live to stdout.
     Returns (full_response_text, list_of_tool_call_dicts).
     """
     full_response   = ""
@@ -501,15 +638,22 @@ def _stream_response_and_collect_tools(
         full_response   += fragment
         sentence_buffer += fragment
 
-        sentences, sentence_buffer = _flush_sentences(sentence_buffer)
-        for s in sentences:
-            _tts_play(s)
+        if speak:
+            sentences, sentence_buffer = _flush_sentences(sentence_buffer)
+            for s in sentences:
+                _tts_play(s)
+        else:
+            if fragment:
+                print(fragment, end="", flush=True)
 
         if chunk.done:
             break
 
-    if sentence_buffer.strip():
-        _tts_play(sentence_buffer)
+    if speak:
+        if sentence_buffer.strip():
+            _tts_play(sentence_buffer)
+    else:
+        print()  # newline to close the streamed response
 
     return full_response, tool_calls
 
@@ -665,6 +809,16 @@ def _apply_tool_calls(
                         from_name, from_otype, to_name, to_otype,
                     )
 
+        # ── delete_entity ─────────────────────────────────────────────
+        elif name == "delete_entity":
+            ename = args.get("name", "").strip()
+            if ename:
+                deleted = gs.delete_entity(ename)
+                if deleted:
+                    log.info("Deleted entity: %s", ename)
+                else:
+                    log.warning("delete_entity: '%s' not found", ename)
+
         # ── legacy upsert_node ────────────────────────────────────────
         elif name == "upsert_node":
             node_name  = args.get("name", "").strip()
@@ -716,7 +870,7 @@ def _apply_tool_calls(
 
 
 # ---------------------------------------------------------------------------
-# MAIN LOOP
+# MAIN
 # ---------------------------------------------------------------------------
 
 def main() -> None:
@@ -748,52 +902,14 @@ def main() -> None:
 
     conversation: list[dict] = []
 
-    log.info("=== Living Memory ready. Press Ctrl-C to quit. ===")
+    # Wire the browser chat handler, then start the viz server
+    chat_handler = make_chat_handler(client, gs, conversation, embed_available, embed_executor)
+    viz_server.start(gs, handle_chat_turn=chat_handler)
+
+    log.info("=== Living Memory ready. Open http://localhost:5050 to chat. Ctrl-C to quit. ===")
 
     try:
-        while True:
-            # --- Stage 1: record ---
-            audio = record_until_silence()
-            if audio.size == 0:
-                log.info("No audio captured — skipping turn")
-                continue
-
-            # --- Stage 2: transcribe ---
-            transcript = transcribe(audio)
-            if not transcript:
-                log.info("Empty transcript — skipping turn")
-                continue
-            log.info("User: %s", transcript)
-
-            # --- Stage 3: build graph context ---
-            context = _build_context(gs, client, transcript, embed_available)
-
-            system_content = SYSTEM_PROMPT_BASE
-            if context:
-                system_content += "\n\n" + context
-
-            messages = [{"role": "system", "content": system_content}]
-            messages.extend(conversation)
-            messages.append({"role": "user", "content": transcript})
-
-            # --- Stage 4: LLM stream + TTS ---
-            response_text, tool_calls = _stream_response_and_collect_tools(client, messages)
-            log.info("Assistant: %s", response_text)
-
-            conversation.append({"role": "user",      "content": transcript})
-            conversation.append({"role": "assistant", "content": response_text})
-
-            # --- Stage 5: graph writes + background embeddings ---
-            if tool_calls:
-                _apply_tool_calls(gs, tool_calls, embed_executor, client, embed_available)
-
-            # --- Stage 6: graph growth counter ---
-            s = gs.stats()
-            print(
-                f"  Graph: {s['entities']} entities, {s['events']} events, "
-                f"{s['commitments']} commitments, {s['relations']} relations"
-            )
-
+        threading.Event().wait()   # block until KeyboardInterrupt
     except KeyboardInterrupt:
         log.info("Shutting down.")
     finally:

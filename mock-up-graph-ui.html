@@ -1,0 +1,793 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Universal Graph</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;1,300&family=DM+Mono:wght@300;400&display=swap');
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg: #06080f;
+    --surface: rgba(255,255,255,0.028);
+    --border: rgba(255,255,255,0.06);
+    --glow-a: #4af0c4;
+    --glow-b: #7b8fff;
+    --glow-c: #c4a0ff;
+    --text-primary: rgba(255,255,255,0.82);
+    --text-dim: rgba(255,255,255,0.32);
+    --text-ghost: rgba(255,255,255,0.12);
+  }
+
+  html, body {
+    height: 100%;
+    background: var(--bg);
+    color: var(--text-primary);
+    font-family: 'DM Mono', monospace;
+    overflow: hidden;
+  }
+
+  /* ── Ambient canvas ── */
+  #ambient {
+    position: fixed; inset: 0; z-index: 0;
+    pointer-events: none;
+  }
+
+  /* ── Layout ── */
+  .shell {
+    position: relative; z-index: 1;
+    display: grid;
+    grid-template-columns: 1fr 320px;
+    grid-template-rows: 1fr auto;
+    height: 100vh;
+    padding: 28px;
+    gap: 20px;
+  }
+
+  /* ── Chat column ── */
+  .chat-col {
+    grid-row: 1 / 3;
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+  }
+
+  /* header */
+  .brand {
+    font-family: 'Cormorant Garamond', serif;
+    font-weight: 300;
+    font-size: 13px;
+    letter-spacing: 0.3em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    padding-bottom: 24px;
+  }
+  .brand span {
+    color: var(--glow-a);
+    opacity: 0.7;
+  }
+
+  /* message feed */
+  .feed {
+    flex: 1;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 24px;
+    padding-right: 8px;
+    scrollbar-width: none;
+  }
+  .feed::-webkit-scrollbar { display: none; }
+
+  .msg {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    animation: msgIn 0.5s cubic-bezier(.16,1,.3,1) both;
+  }
+  @keyframes msgIn {
+    from { opacity: 0; transform: translateY(12px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+
+  .msg-label {
+    font-size: 9px;
+    letter-spacing: 0.25em;
+    text-transform: uppercase;
+    color: var(--text-ghost);
+  }
+  .msg.user .msg-label { color: rgba(74,240,196,0.35); }
+
+  .msg-body {
+    font-family: 'Cormorant Garamond', serif;
+    font-size: 18px;
+    line-height: 1.65;
+    font-weight: 300;
+    color: var(--text-primary);
+    max-width: 560px;
+  }
+  .msg.user .msg-body {
+    color: rgba(255,255,255,0.55);
+    font-style: italic;
+    font-size: 16px;
+  }
+
+  .msg.system .msg-body {
+    color: var(--text-primary);
+  }
+
+  /* typing indicator */
+  .typing {
+    display: flex; align-items: center; gap: 5px;
+    height: 20px;
+    opacity: 0;
+    transition: opacity 0.3s;
+  }
+  .typing.active { opacity: 1; }
+  .typing-dot {
+    width: 4px; height: 4px;
+    border-radius: 50%;
+    background: var(--glow-a);
+    animation: tdot 1.2s ease-in-out infinite;
+  }
+  .typing-dot:nth-child(2) { animation-delay: 0.2s; background: var(--glow-b); }
+  .typing-dot:nth-child(3) { animation-delay: 0.4s; background: var(--glow-c); }
+  @keyframes tdot {
+    0%,80%,100% { transform: scale(0.6); opacity: 0.3; }
+    40% { transform: scale(1); opacity: 1; }
+  }
+
+  /* input area */
+  .input-area {
+    padding-top: 24px;
+    position: relative;
+  }
+
+  .input-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    padding: 14px 18px;
+    transition: border-color 0.3s, box-shadow 0.3s;
+  }
+  .input-row:focus-within {
+    border-color: rgba(74,240,196,0.2);
+    box-shadow: 0 0 0 1px rgba(74,240,196,0.08), 0 0 32px rgba(74,240,196,0.04);
+  }
+
+  .input-row input {
+    flex: 1;
+    background: none;
+    border: none;
+    outline: none;
+    font-family: 'DM Mono', monospace;
+    font-size: 13px;
+    font-weight: 300;
+    color: var(--text-primary);
+    caret-color: var(--glow-a);
+  }
+  .input-row input::placeholder { color: var(--text-ghost); }
+
+  .send-btn {
+    background: none;
+    border: none;
+    cursor: pointer;
+    color: var(--text-ghost);
+    display: flex; align-items: center;
+    transition: color 0.2s;
+    padding: 0;
+  }
+  .send-btn:hover { color: var(--glow-a); }
+
+  /* voice btn */
+  .voice-btn {
+    background: none;
+    border: none;
+    cursor: pointer;
+    color: var(--text-ghost);
+    display: flex; align-items: center;
+    transition: color 0.2s, transform 0.2s;
+    padding: 0;
+  }
+  .voice-btn.active {
+    color: var(--glow-a);
+    animation: voicePulse 1.5s ease-in-out infinite;
+  }
+  @keyframes voicePulse {
+    0%,100% { transform: scale(1); }
+    50% { transform: scale(1.15); }
+  }
+
+  /* hint */
+  .input-hint {
+    margin-top: 8px;
+    font-size: 9px;
+    letter-spacing: 0.2em;
+    color: var(--text-ghost);
+    text-transform: uppercase;
+  }
+
+  /* ── Right column ── */
+  .right-col {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+  }
+
+  /* panel base */
+  .panel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    overflow: hidden;
+    position: relative;
+  }
+
+  .panel-header {
+    padding: 12px 16px 10px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .panel-title {
+    font-size: 9px;
+    letter-spacing: 0.3em;
+    text-transform: uppercase;
+    color: var(--text-ghost);
+  }
+
+  .panel-status {
+    width: 5px; height: 5px;
+    border-radius: 50%;
+    background: var(--glow-a);
+    box-shadow: 0 0 6px var(--glow-a);
+    animation: statusBlink 3s ease-in-out infinite;
+  }
+  @keyframes statusBlink {
+    0%,100% { opacity: 1; }
+    50% { opacity: 0.3; }
+  }
+
+  /* ── Waveform panel ── */
+  .waveform-panel { flex-shrink: 0; }
+
+  #waveCanvas {
+    display: block;
+    width: 100%;
+    height: 100px;
+  }
+
+  /* ── Graph panel ── */
+  .graph-panel { flex: 1; min-height: 0; }
+
+  #graphCanvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+  }
+
+  /* ── Mindstate bar ── */
+  .mindstate {
+    grid-column: 2;
+    grid-row: 2;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    padding: 12px 16px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-shrink: 0;
+  }
+
+  .mindstate-label {
+    font-size: 9px;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--text-ghost);
+    white-space: nowrap;
+  }
+
+  .mindstate-nodes {
+    display: flex;
+    gap: 6px;
+    flex: 1;
+  }
+
+  .node-tag {
+    font-size: 9px;
+    letter-spacing: 0.08em;
+    color: var(--text-dim);
+    background: rgba(255,255,255,0.04);
+    border: 1px solid var(--border);
+    border-radius: 2px;
+    padding: 3px 7px;
+    white-space: nowrap;
+    transition: all 0.4s;
+  }
+  .node-tag.lit {
+    color: var(--glow-a);
+    border-color: rgba(74,240,196,0.2);
+    background: rgba(74,240,196,0.05);
+  }
+
+  /* scrollbar */
+  .feed { padding-bottom: 8px; }
+
+  /* subtle grid overlay */
+  .grid-overlay {
+    position: fixed; inset: 0; z-index: 0; pointer-events: none;
+    background-image:
+      linear-gradient(rgba(255,255,255,0.012) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,0.012) 1px, transparent 1px);
+    background-size: 48px 48px;
+  }
+</style>
+</head>
+<body>
+
+<canvas id="ambient"></canvas>
+<div class="grid-overlay"></div>
+
+<div class="shell">
+
+  <!-- ── Chat column ── -->
+  <div class="chat-col">
+    <div class="brand">Universal Graph <span>◆</span> Cognitive Layer</div>
+
+    <div class="feed" id="feed">
+      <div class="msg system">
+        <div class="msg-label">system</div>
+        <div class="msg-body">Your memory is ready. Begin wherever your mind is.</div>
+      </div>
+    </div>
+
+    <div class="typing" id="typing">
+      <div class="typing-dot"></div>
+      <div class="typing-dot"></div>
+      <div class="typing-dot"></div>
+    </div>
+
+    <div class="input-area">
+      <div class="input-row">
+        <button class="voice-btn" id="voiceBtn" title="Voice input">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+            <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+            <path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v4M8 23h8"/>
+          </svg>
+        </button>
+        <input type="text" id="chatInput" placeholder="a thought, a question, a memory…" autocomplete="off" />
+        <button class="send-btn" id="sendBtn" title="Send">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+            <line x1="22" y1="2" x2="11" y2="13"/>
+            <polygon points="22 2 15 22 11 13 2 9 22 2"/>
+          </svg>
+        </button>
+      </div>
+      <div class="input-hint">↵ to send · hold mic to speak</div>
+    </div>
+  </div>
+
+  <!-- ── Right column ── -->
+  <div class="right-col">
+
+    <div class="panel waveform-panel">
+      <div class="panel-header">
+        <span class="panel-title">Voice Response</span>
+        <div class="panel-status" id="waveStatus"></div>
+      </div>
+      <canvas id="waveCanvas"></canvas>
+    </div>
+
+    <div class="panel graph-panel">
+      <div class="panel-header">
+        <span class="panel-title">Memory Graph</span>
+        <div class="panel-status"></div>
+      </div>
+      <canvas id="graphCanvas"></canvas>
+    </div>
+
+  </div>
+
+  <!-- ── Mindstate bar ── -->
+  <div class="mindstate">
+    <span class="mindstate-label">active nodes</span>
+    <div class="mindstate-nodes" id="mindstateNodes">
+      <span class="node-tag">identity</span>
+      <span class="node-tag">work</span>
+      <span class="node-tag">focus</span>
+      <span class="node-tag">context</span>
+      <span class="node-tag">memory</span>
+    </div>
+  </div>
+
+</div>
+
+<script>
+// ─────────────────────────────────────────
+// AMBIENT BACKGROUND — slow drifting orbs
+// ─────────────────────────────────────────
+(function() {
+  const canvas = document.getElementById('ambient');
+  const ctx = canvas.getContext('2d');
+
+  const orbs = [
+    { x: 0.15, y: 0.3,  r: 320, color: '#4af0c4', vx: 0.00008, vy: 0.00005, opacity: 0.035 },
+    { x: 0.8,  y: 0.7,  r: 400, color: '#7b8fff', vx: -0.00006, vy: 0.00007, opacity: 0.03 },
+    { x: 0.5,  y: 0.1,  r: 280, color: '#c4a0ff', vx: 0.00005, vy: 0.00009, opacity: 0.025 },
+    { x: 0.9,  y: 0.2,  r: 250, color: '#4af0c4', vx: -0.00007, vy: -0.00004, opacity: 0.02 },
+  ];
+
+  let t = 0;
+
+  function resize() {
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+  }
+
+  function draw() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    const W = canvas.width, H = canvas.height;
+
+    orbs.forEach(o => {
+      o.x += o.vx; o.y += o.vy;
+      if (o.x < -0.2) o.x = 1.2;
+      if (o.x > 1.2) o.x = -0.2;
+      if (o.y < -0.2) o.y = 1.2;
+      if (o.y > 1.2) o.y = -0.2;
+
+      const grd = ctx.createRadialGradient(o.x*W, o.y*H, 0, o.x*W, o.y*H, o.r);
+      grd.addColorStop(0, o.color + Math.round(o.opacity*255).toString(16).padStart(2,'0'));
+      grd.addColorStop(1, o.color + '00');
+      ctx.fillStyle = grd;
+      ctx.beginPath();
+      ctx.arc(o.x*W, o.y*H, o.r, 0, Math.PI*2);
+      ctx.fill();
+    });
+
+    t++;
+    requestAnimationFrame(draw);
+  }
+
+  resize();
+  window.addEventListener('resize', resize);
+  draw();
+})();
+
+
+// ─────────────────────────────────────────
+// WAVEFORM — organic sine-stack
+// ─────────────────────────────────────────
+const waveCanvas = document.getElementById('waveCanvas');
+const waveCtx = waveCanvas.getContext('2d');
+let waveActive = false;
+let waveAmplitude = 0;
+let waveTargetAmp = 0;
+
+function resizeWave() {
+  const rect = waveCanvas.parentElement.getBoundingClientRect();
+  waveCanvas.width = rect.width;
+  waveCanvas.height = 100;
+}
+
+function drawWave(t) {
+  const W = waveCanvas.width, H = waveCanvas.height;
+  waveCtx.clearRect(0, 0, W, H);
+
+  waveAmplitude += (waveTargetAmp - waveAmplitude) * 0.04;
+
+  const layers = [
+    { freq: 1.4, phase: t*0.012, amp: 1.0,  color: '#4af0c4', alpha: 0.6 },
+    { freq: 2.1, phase: t*0.018, amp: 0.6,  color: '#7b8fff', alpha: 0.4 },
+    { freq: 0.8, phase: t*0.008, amp: 0.8,  color: '#c4a0ff', alpha: 0.25 },
+  ];
+
+  layers.forEach(layer => {
+    const amp = waveAmplitude * layer.amp;
+    waveCtx.beginPath();
+    for (let x = 0; x <= W; x++) {
+      const progress = x / W;
+      const envelope = Math.sin(progress * Math.PI); // fade in/out at edges
+      const y = H/2 + Math.sin(progress * Math.PI * 2 * layer.freq + layer.phase) * amp * envelope * 0.85
+                     + Math.sin(progress * Math.PI * 3.3 * layer.freq + layer.phase * 1.3) * amp * 0.3 * envelope;
+      x === 0 ? waveCtx.moveTo(x, y) : waveCtx.lineTo(x, y);
+    }
+
+    const grad = waveCtx.createLinearGradient(0, 0, W, 0);
+    grad.addColorStop(0, layer.color + '00');
+    grad.addColorStop(0.2, layer.color + Math.round(layer.alpha * 255).toString(16).padStart(2,'0'));
+    grad.addColorStop(0.8, layer.color + Math.round(layer.alpha * 255).toString(16).padStart(2,'0'));
+    grad.addColorStop(1, layer.color + '00');
+
+    waveCtx.strokeStyle = grad;
+    waveCtx.lineWidth = 1.5;
+    waveCtx.shadowBlur = waveActive ? 8 : 3;
+    waveCtx.shadowColor = layer.color;
+    waveCtx.stroke();
+  });
+
+  // centre line when idle
+  if (!waveActive && waveAmplitude < 2) {
+    waveCtx.beginPath();
+    waveCtx.moveTo(W*0.1, H/2); waveCtx.lineTo(W*0.9, H/2);
+    waveCtx.strokeStyle = 'rgba(255,255,255,0.05)';
+    waveCtx.lineWidth = 1;
+    waveCtx.shadowBlur = 0;
+    waveCtx.stroke();
+  }
+}
+
+resizeWave();
+window.addEventListener('resize', resizeWave);
+
+
+// ─────────────────────────────────────────
+// MEMORY GRAPH
+// ─────────────────────────────────────────
+const graphCanvas = document.getElementById('graphCanvas');
+const graphCtx = graphCanvas.getContext('2d');
+
+const COLORS = ['#4af0c4','#7b8fff','#c4a0ff','#f0a04a','#f07a7a'];
+
+const nodes = [
+  { id:0, label:'self',      x:0.5, y:0.5, r:7, color:COLORS[0], connections:[1,2,3,4,5], mass:1.8 },
+  { id:1, label:'work',      x:0.3, y:0.3, r:5, color:COLORS[1], connections:[0,2,6],     mass:1.2 },
+  { id:2, label:'memory',    x:0.7, y:0.3, r:5, color:COLORS[0], connections:[0,1,7],     mass:1.2 },
+  { id:3, label:'goals',     x:0.3, y:0.7, r:4, color:COLORS[2], connections:[0,4],       mass:1.0 },
+  { id:4, label:'people',    x:0.7, y:0.7, r:4, color:COLORS[3], connections:[0,3,5],     mass:1.0 },
+  { id:5, label:'context',   x:0.5, y:0.8, r:4, color:COLORS[1], connections:[0,4],       mass:1.0 },
+  { id:6, label:'project',   x:0.15, y:0.45, r:3, color:COLORS[4], connections:[1],       mass:0.8 },
+  { id:7, label:'idea',      x:0.85, y:0.45, r:3, color:COLORS[2], connections:[2],       mass:0.8 },
+];
+
+// physics velocities
+nodes.forEach(n => { n.vx = 0; n.vy = 0; n.pulse = Math.random()*Math.PI*2; });
+
+function resizeGraph() {
+  const rect = graphCanvas.parentElement.getBoundingClientRect();
+  graphCanvas.width = rect.width;
+  graphCanvas.height = rect.height - 40; // panel header
+  // map logical coords to canvas
+  nodes.forEach(n => {
+    if (!n._initialised) {
+      n.cx = n.x * graphCanvas.width;
+      n.cy = n.y * graphCanvas.height;
+      n._initialised = true;
+    }
+  });
+}
+
+function drawGraph(t) {
+  const W = graphCanvas.width, H = graphCanvas.height;
+  if (!W || !H) return;
+
+  graphCtx.clearRect(0, 0, W, H);
+
+  // soft force simulation
+  nodes.forEach(a => {
+    nodes.forEach(b => {
+      if (a.id >= b.id) return;
+      const dx = b.cx - a.cx, dy = b.cy - a.cy;
+      const dist = Math.sqrt(dx*dx+dy*dy) || 1;
+      const connected = a.connections.includes(b.id);
+      const ideal = connected ? Math.min(W,H) * 0.3 : Math.min(W,H) * 0.28;
+      const force = (dist - ideal) * 0.002;
+      const fx = (dx/dist)*force, fy = (dy/dist)*force;
+      a.vx += fx/a.mass; a.vy += fy/a.mass;
+      b.vx -= fx/b.mass; b.vy -= fy/b.mass;
+    });
+    // centre gravity
+    a.vx += (W/2 - a.cx)*0.0005;
+    a.vy += (H/2 - a.cy)*0.0005;
+    // dampen
+    a.vx *= 0.88; a.vy *= 0.88;
+    a.cx += a.vx; a.cy += a.vy;
+    // boundary
+    const pad = 20;
+    a.cx = Math.max(pad, Math.min(W-pad, a.cx));
+    a.cy = Math.max(pad, Math.min(H-pad, a.cy));
+  });
+
+  // draw edges
+  nodes.forEach(n => {
+    n.connections.forEach(cid => {
+      if (cid <= n.id) return;
+      const target = nodes[cid];
+      const dx = target.cx - n.cx, dy = target.cy - n.cy;
+      const dist = Math.sqrt(dx*dx+dy*dy);
+
+      // animated particle along edge
+      const progress = ((t * 0.004 + n.id * 0.3) % 1);
+      const px = n.cx + dx * progress;
+      const py = n.cy + dy * progress;
+
+      graphCtx.beginPath();
+      graphCtx.moveTo(n.cx, n.cy);
+      graphCtx.lineTo(target.cx, target.cy);
+      const alpha = 0.08 + Math.sin(t*0.02 + n.id)*0.03;
+      graphCtx.strokeStyle = `rgba(255,255,255,${alpha})`;
+      graphCtx.lineWidth = 0.8;
+      graphCtx.shadowBlur = 0;
+      graphCtx.stroke();
+
+      // particle
+      graphCtx.beginPath();
+      graphCtx.arc(px, py, 1.5, 0, Math.PI*2);
+      graphCtx.fillStyle = n.color + 'aa';
+      graphCtx.shadowBlur = 6;
+      graphCtx.shadowColor = n.color;
+      graphCtx.fill();
+    });
+  });
+
+  // draw nodes
+  nodes.forEach(n => {
+    n.pulse += 0.02;
+    const breathe = Math.sin(n.pulse) * 1.2;
+    const r = n.r + breathe;
+
+    // glow halo
+    const halo = graphCtx.createRadialGradient(n.cx, n.cy, 0, n.cx, n.cy, r*3.5);
+    halo.addColorStop(0, n.color + '30');
+    halo.addColorStop(1, n.color + '00');
+    graphCtx.beginPath();
+    graphCtx.arc(n.cx, n.cy, r*3.5, 0, Math.PI*2);
+    graphCtx.fillStyle = halo;
+    graphCtx.shadowBlur = 0;
+    graphCtx.fill();
+
+    // core
+    graphCtx.beginPath();
+    graphCtx.arc(n.cx, n.cy, r, 0, Math.PI*2);
+    graphCtx.fillStyle = n.color;
+    graphCtx.shadowBlur = 12;
+    graphCtx.shadowColor = n.color;
+    graphCtx.fill();
+    graphCtx.shadowBlur = 0;
+
+    // label
+    graphCtx.font = '9px "DM Mono", monospace';
+    graphCtx.fillStyle = 'rgba(255,255,255,0.3)';
+    graphCtx.textAlign = 'center';
+    graphCtx.fillText(n.label, n.cx, n.cy + r + 11);
+  });
+}
+
+resizeGraph();
+window.addEventListener('resize', () => { resizeGraph(); });
+
+
+// ─────────────────────────────────────────
+// MAIN LOOP
+// ─────────────────────────────────────────
+let frame = 0;
+function loop() {
+  drawWave(frame);
+  drawGraph(frame);
+  frame++;
+  requestAnimationFrame(loop);
+}
+loop();
+
+
+// ─────────────────────────────────────────
+// CHAT INTERACTION
+// ─────────────────────────────────────────
+const feed = document.getElementById('feed');
+const input = document.getElementById('chatInput');
+const sendBtn = document.getElementById('sendBtn');
+const voiceBtn = document.getElementById('voiceBtn');
+const typing = document.getElementById('typing');
+
+const responses = [
+  "I've connected this to your existing context around focus and work. Three related memories surfaced.",
+  "That resonates with a pattern I've been noticing — your goals and identity nodes are converging.",
+  "Noted. I've woven this into your memory graph. The idea node just formed a new edge.",
+  "This seems tied to something you've been thinking about. Shall I surface the related threads?",
+  "Memory updated. I can feel the shape of this thought fitting with what came before.",
+  "Interesting — this is the third time this idea has appeared in a new form. I'm tracing the thread.",
+];
+const nodeTags = ['identity','work','focus','context','memory','goals','idea','reflection','project','people'];
+let responseIdx = 0;
+
+function addMessage(text, type='user') {
+  const msg = document.createElement('div');
+  msg.className = `msg ${type}`;
+  msg.innerHTML = `<div class="msg-label">${type === 'user' ? 'you' : 'graph'}</div>
+                   <div class="msg-body">${text}</div>`;
+  feed.appendChild(msg);
+  feed.scrollTop = feed.scrollHeight;
+}
+
+function activateRandomNodes() {
+  const tags = document.querySelectorAll('.node-tag');
+  tags.forEach(t => t.classList.remove('lit'));
+  const count = 2 + Math.floor(Math.random()*2);
+  const shuffled = [...tags].sort(()=>Math.random()-0.5);
+  shuffled.slice(0,count).forEach(t => t.classList.add('lit'));
+}
+
+function addNewGraphNode(label) {
+  const centerNode = nodes[0];
+  const angle = Math.random() * Math.PI * 2;
+  const dist = 80 + Math.random()*60;
+  const newNode = {
+    id: nodes.length,
+    label,
+    cx: centerNode.cx + Math.cos(angle)*dist,
+    cy: centerNode.cy + Math.sin(angle)*dist,
+    r: 3,
+    color: COLORS[Math.floor(Math.random()*COLORS.length)],
+    connections: [Math.floor(Math.random()*4)],
+    mass: 0.9,
+    vx: 0, vy: 0, pulse: Math.random()*Math.PI*2,
+    _initialised: true,
+  };
+  newNode.connections[0].connections?.push(newNode.id);
+  nodes.push(newNode);
+}
+
+function sendMessage() {
+  const text = input.value.trim();
+  if (!text) return;
+
+  addMessage(text, 'user');
+  input.value = '';
+
+  // show typing
+  typing.classList.add('active');
+  waveTargetAmp = 18;
+
+  // activate graph
+  activateRandomNodes();
+  if (nodes.length < 14) {
+    const words = text.split(' ');
+    const label = words[Math.floor(Math.random()*words.length)].toLowerCase().replace(/[^a-z]/g,'');
+    if (label.length > 2) setTimeout(()=>addNewGraphNode(label), 600);
+  }
+
+  // respond
+  setTimeout(() => {
+    typing.classList.remove('active');
+    const reply = responses[responseIdx++ % responses.length];
+    addMessage(reply, 'system');
+    waveTargetAmp = 28;
+    setTimeout(() => { waveTargetAmp = 4; }, 3500);
+  }, 1400 + Math.random()*600);
+}
+
+sendBtn.addEventListener('click', sendMessage);
+input.addEventListener('keydown', e => { if (e.key === 'Enter') sendMessage(); });
+
+// Voice button toggle
+let voiceActive = false;
+voiceBtn.addEventListener('mousedown', () => {
+  voiceActive = true;
+  voiceBtn.classList.add('active');
+  waveTargetAmp = 22;
+  document.getElementById('waveStatus').style.background = '#f0a04a';
+});
+voiceBtn.addEventListener('mouseup', () => {
+  voiceActive = false;
+  voiceBtn.classList.remove('active');
+  waveTargetAmp = 4;
+  document.getElementById('waveStatus').style.background = '';
+});
+
+// Idle wave
+setInterval(() => {
+  if (!voiceActive && waveTargetAmp < 5) {
+    waveTargetAmp = 2 + Math.random()*3;
+    setTimeout(() => { if (!voiceActive) waveTargetAmp = 1; }, 800);
+  }
+}, 4000);
+</script>
+</body>
+</html>

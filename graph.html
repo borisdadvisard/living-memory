@@ -1,126 +1,3 @@
-"""
-boris.py — Visualise the Living Memory DuckDB knowledge graph.
-
-Generates Viz/graph.html with a bioluminescent dark aesthetic:
-  · Glowing nodes sized by connection count
-  · Animated particle flow along edges
-  · Labels on hover / click only
-  · Click a node to isolate it and its neighbours; click again or click
-    background to reset
-  · Physics settles in ~300 iterations, then stops; a soft sine-wave halo
-    provides the breathing idle effect
-
-Run:
-    cd "/Users/borisdadvisard/Documents/ClaudeCode/Living Memory"
-    source venv/bin/activate
-    python boris.py
-"""
-
-'''also install and run Harlequin to edit the DB
-cd "/Users/borisdadvisard/Documents/ClaudeCode/Living Memory"
-source venv/bin/activate
-pip install harlequin
-harlequin graph.db --init-path init.sql
-'''
-
-import json
-import os
-import webbrowser
-from collections import Counter
-
-import duckdb
-
-# ── 1. Connect & load VSS ────────────────────────────────────────────────────
-con = duckdb.connect("graph.db")
-try:
-    con.execute("INSTALL vss")
-except duckdb.IOException:
-    pass
-con.execute("LOAD vss")
-con.execute("SET hnsw_enable_experimental_persistence = true")
-
-# ── 2. Detect schema version ──────────────────────────────────────────────────
-tables = {
-    r[0]
-    for r in con.execute(
-        "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'"
-    ).fetchall()
-}
-use_new_schema = "entities" in tables
-
-# ── 3. Query nodes & edges ────────────────────────────────────────────────────
-if use_new_schema:
-    nodes_df = con.sql("""
-        SELECT id::TEXT AS id, name AS label_name, 'entity:'||type AS type_tag
-        FROM entities
-        UNION ALL
-        SELECT id::TEXT, title, 'event:'||type
-        FROM events
-        UNION ALL
-        SELECT id::TEXT, title, 'commitment:'||status
-        FROM commitments
-    """).df()
-
-    edges_df = con.sql("""
-        SELECT r.from_id::TEXT AS from_id, r.to_id::TEXT AS to_id, r.type AS relationship
-        FROM relations r
-    """).df()
-
-    print("[Universal Graph schema]")
-else:
-    nodes_df = con.sql("""
-        SELECT id::TEXT AS id, name AS label_name,
-               'entity:'||lower(label) AS type_tag
-        FROM nodes
-    """).df()
-
-    edges_df = con.sql("""
-        SELECT fn.id::TEXT AS from_id, tn.id::TEXT AS to_id, e.relationship
-        FROM edges e
-        JOIN nodes fn ON e.from_id = fn.id
-        JOIN nodes tn ON e.to_id   = tn.id
-    """).df()
-
-    print("[Legacy schema — run migrate.py to upgrade]")
-
-print(f"Nodes: {len(nodes_df)}  |  Edges: {len(edges_df)}")
-
-# ── 4. Build graph data with degree counts ────────────────────────────────────
-degree: Counter = Counter()
-for _, e in edges_df.iterrows():
-    degree[str(e["from_id"])] += 1
-    degree[str(e["to_id"])] += 1
-
-node_ids = set(nodes_df["id"].tolist())
-
-nodes_data = [
-    {
-        "id":       str(n["id"]),
-        "label":    str(n["label_name"]),
-        "type_tag": str(n["type_tag"]).lower(),
-        "degree":   degree.get(str(n["id"]), 0),
-    }
-    for _, n in nodes_df.iterrows()
-]
-
-edges_data = [
-    {
-        "id":   f"e{i}",
-        "from": str(e["from_id"]),
-        "to":   str(e["to_id"]),
-        "type": str(e["relationship"]),
-    }
-    for i, (_, e) in enumerate(edges_df.iterrows())
-    if str(e["from_id"]) in node_ids and str(e["to_id"]) in node_ids
-]
-
-# Embed as JSON; escape </script> so it can't break the surrounding HTML tag
-graph_json = json.dumps(
-    {"nodes": nodes_data, "edges": edges_data}, ensure_ascii=False
-).replace("</script>", "<\\/script>")
-
-# ── 5. HTML template ──────────────────────────────────────────────────────────
-HTML_TEMPLATE = """\
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -179,7 +56,7 @@ HTML_TEMPLATE = """\
   <div id="meta"></div>
 
   <script>
-    const GRAPH_DATA = __GRAPH_JSON__;
+    const GRAPH_DATA = {"nodes": [{"id": "47263853-bcbc-43f7-8fb8-f7610d3b3ae6", "label": "Boris", "type_tag": "entity:person", "degree": 3}, {"id": "1d3defba-baaa-495b-935b-4085f6a0ca3b", "label": "London", "type_tag": "entity:place", "degree": 2}, {"id": "69ecdbed-b5b4-4cff-8af0-80eeb886081c", "label": "France", "type_tag": "entity:place", "degree": 0}, {"id": "9c62b747-88a0-4464-9f09-bb24980d9074", "label": "Spotify", "type_tag": "entity:org", "degree": 1}, {"id": "818a6c39-a2b0-4fb7-812f-3314ae3fce1c", "label": "Gerome", "type_tag": "entity:person", "degree": 0}, {"id": "514dc55b-1c3d-43fe-ba32-2b55d982247e", "label": "Snowflake", "type_tag": "entity:org", "degree": 0}, {"id": "475fe8c1-e04d-4272-bec4-4a451842f463", "label": "Atlan", "type_tag": "entity:org", "degree": 0}, {"id": "6acacdd1-a1e5-4b2c-9609-e7db014c4a59", "label": "ServiceNow", "type_tag": "entity:org", "degree": 0}, {"id": "07ed2249-3314-4e3d-966b-d2b1d78f1aaf", "label": "Alterix", "type_tag": "entity:org", "degree": 0}, {"id": "7d767759-1c5a-4233-9703-10ada390778b", "label": "Lyon", "type_tag": "entity:place", "degree": 1}, {"id": "498a520a-2d4b-400f-8021-588e99a335f0", "label": "Garront", "type_tag": "entity:place", "degree": 1}, {"id": "f01b074f-2395-4dea-8c68-1d1faebd56af", "label": "Bim", "type_tag": "entity:person", "degree": 2}, {"id": "63853e71-df63-4142-a2bb-86e19b8fefa4", "label": "Delivery in London", "type_tag": "event:state_change", "degree": 0}], "edges": [{"id": "e0", "from": "9c62b747-88a0-4464-9f09-bb24980d9074", "to": "47263853-bcbc-43f7-8fb8-f7610d3b3ae6", "type": "used_by"}, {"id": "e1", "from": "47263853-bcbc-43f7-8fb8-f7610d3b3ae6", "to": "1d3defba-baaa-495b-935b-4085f6a0ca3b", "type": "lives_in"}, {"id": "e2", "from": "498a520a-2d4b-400f-8021-588e99a335f0", "to": "7d767759-1c5a-4233-9703-10ada390778b", "type": "located_in"}, {"id": "e3", "from": "47263853-bcbc-43f7-8fb8-f7610d3b3ae6", "to": "f01b074f-2395-4dea-8c68-1d1faebd56af", "type": "related_to"}, {"id": "e4", "from": "f01b074f-2395-4dea-8c68-1d1faebd56af", "to": "1d3defba-baaa-495b-935b-4085f6a0ca3b", "type": "lives_in"}]};
 
     // ── Colour palette ──────────────────────────────────────────────────────
     const TYPE_COLORS = {
@@ -412,14 +289,4 @@ HTML_TEMPLATE = """\
     });
   </script>
 </body>
-</html>"""
-
-# ── 6. Inject data & write ────────────────────────────────────────────────────
-html = HTML_TEMPLATE.replace("__GRAPH_JSON__", graph_json)
-
-out = "graph.html"
-with open(out, "w", encoding="utf-8") as f:
-    f.write(html)
-
-print(f"Saved → {os.path.abspath(out)}")
-webbrowser.open("file://" + os.path.abspath(out))
+</html>

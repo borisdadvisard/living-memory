@@ -251,6 +251,19 @@ _SCHEMA_STMTS = [
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_adj_node ON adjacency_cache(node_id, node_type)",
+
+    # ── Change log ────────────────────────────────────────────────────────
+    "CREATE SEQUENCE IF NOT EXISTS seq_graph_changes_id",
+    """
+    CREATE TABLE IF NOT EXISTS graph_changes (
+        id        BIGINT    DEFAULT nextval('seq_graph_changes_id') PRIMARY KEY,
+        ts        TIMESTAMP NOT NULL DEFAULT now(),
+        operation VARCHAR   NOT NULL,
+        category  VARCHAR   NOT NULL,
+        label     VARCHAR   NOT NULL,
+        detail    VARCHAR   NOT NULL DEFAULT ''
+    )
+    """,
 ]
 
 _HNSW_STMT = (
@@ -498,6 +511,9 @@ class GraphStore:
         source_json    = json.dumps(source_ids or [])
 
         with self._lock:
+            exists = self._conn.execute(
+                "SELECT 1 FROM entities WHERE name = ?", [key]
+            ).fetchone()
             self._conn.execute(
                 """
                 INSERT INTO entities (type, name, aliases, attributes, confidence, source_ids)
@@ -515,6 +531,7 @@ class GraphStore:
             row = self._conn.execute(
                 "SELECT id FROM entities WHERE name = ?", [key]
             ).fetchone()
+            self._log_change("updated" if exists else "inserted", "entity", key, f"entity:{etype}")
             return str(row[0])
 
     # ------------------------------------------------------------------
@@ -546,6 +563,9 @@ class GraphStore:
         key = title.strip()
 
         with self._lock:
+            exists = self._conn.execute(
+                "SELECT 1 FROM events WHERE title = ?", [key]
+            ).fetchone()
             self._conn.execute(
                 """
                 INSERT INTO events (type, title, description, start_time, end_time,
@@ -577,6 +597,7 @@ class GraphStore:
             row = self._conn.execute(
                 "SELECT id FROM events WHERE title = ?", [key]
             ).fetchone()
+            self._log_change("updated" if exists else "inserted", "event", key, f"event:{etype}")
             return str(row[0])
 
     # ------------------------------------------------------------------
@@ -609,6 +630,9 @@ class GraphStore:
         key = title.strip()
 
         with self._lock:
+            exists = self._conn.execute(
+                "SELECT 1 FROM commitments WHERE title = ?", [key]
+            ).fetchone()
             self._conn.execute(
                 """
                 INSERT INTO commitments (title, description, owner_id, related_event_id,
@@ -635,6 +659,7 @@ class GraphStore:
             row = self._conn.execute(
                 "SELECT id FROM commitments WHERE title = ?", [key]
             ).fetchone()
+            self._log_change("updated" if exists else "inserted", "commitment", key, f"commitment:{s}")
             return str(row[0])
 
     # ------------------------------------------------------------------
@@ -664,6 +689,10 @@ class GraphStore:
                 f"Allowed: {sorted(ALLOWED_RELATION_TYPES)}"
             )
         with self._lock:
+            exists = self._conn.execute(
+                "SELECT 1 FROM relations WHERE from_id = ?::UUID AND to_id = ?::UUID AND type = ?",
+                [from_id, to_id, rel],
+            ).fetchone()
             self._conn.execute(
                 """
                 INSERT INTO relations (from_id, from_type, to_id, to_type, type,
@@ -683,12 +712,70 @@ class GraphStore:
                     json.dumps(source_ids or []),
                 ],
             )
+            # Build a human-readable label from entity names where available
+            fr = self._conn.execute(
+                "SELECT name FROM entities WHERE id = ?::UUID", [from_id]
+            ).fetchone()
+            to = self._conn.execute(
+                "SELECT name FROM entities WHERE id = ?::UUID", [to_id]
+            ).fetchone()
+            from_label = fr[0] if fr else from_id[:8]
+            to_label   = to[0] if to else to_id[:8]
+            self._log_change(
+                "updated" if exists else "inserted",
+                "relation",
+                f"{from_label} → {to_label}",
+                rel,
+            )
             self._refresh_adjacency_cache()
+
+    def delete_entity(self, name: str) -> bool:
+        """
+        Permanently delete an entity by name and cascade-remove all associated
+        relations, embeddings, and state assertions.
+        Rebuilds the adjacency cache after deletion.
+        Returns True if the entity existed and was deleted, False if not found.
+        """
+        key = name.strip()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id FROM entities WHERE name = ?", [key]
+            ).fetchone()
+            if not row:
+                return False
+            eid = str(row[0])
+
+            self._conn.execute(
+                "DELETE FROM relations WHERE from_id = ?::UUID OR to_id = ?::UUID",
+                [eid, eid],
+            )
+            self._conn.execute(
+                "DELETE FROM embeddings WHERE object_id = ? AND object_type = 'entity'",
+                [eid],
+            )
+            self._conn.execute(
+                "DELETE FROM state_assertions WHERE subject_id = ?::UUID AND subject_type = 'entity'",
+                [eid],
+            )
+            self._conn.execute("DELETE FROM entities WHERE name = ?", [key])
+            self._log_change("deleted", "entity", key, "removed with all relations")
+            self._refresh_adjacency_cache()
+            return True
 
     def _refresh_adjacency_cache(self) -> None:
         """Rebuild full adjacency cache. Must be called while holding self._lock."""
         for stmt in _REFRESH_STMTS:
             self._conn.execute(stmt)
+
+    def _log_change(self, operation: str, category: str, label: str, detail: str = "") -> None:
+        """Append one row to graph_changes. Must be called while holding self._lock."""
+        try:
+            self._conn.execute(
+                "INSERT INTO graph_changes (operation, category, label, detail) VALUES (?, ?, ?, ?)",
+                [operation, category, label, detail],
+            )
+        except Exception as exc:
+            log.debug("changelog write failed: %s", exc)
 
     # ------------------------------------------------------------------
     # EMBEDDINGS
@@ -929,6 +1016,9 @@ class GraphStore:
 
     def submit_add_relation(self, *args, **kwargs) -> Future:
         return self._executor.submit(self.add_relation, *args, **kwargs)
+
+    def submit_delete_entity(self, name: str) -> Future:
+        return self._executor.submit(self.delete_entity, name)
 
     # ------------------------------------------------------------------
     # BACKWARD-COMPAT WRAPPERS (legacy upsert_node / add_edge surface)

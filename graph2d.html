@@ -1,0 +1,1063 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Living Memory</title>
+  <link rel="stylesheet" href="lib/vis-9.1.2/vis-network.css">
+  <script src="lib/vis-9.1.2/vis-network.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #09090f; overflow: hidden; font-family: 'DM Mono', 'Courier New', monospace; }
+
+    /* ── Graph canvas ───────────────────────────────────────────────────────── */
+    #graph {
+      width: 100vw; height: 100vh;
+      background-color: #09090f;
+      background-image:
+        linear-gradient(rgba(100, 130, 210, 0.032) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(100, 130, 210, 0.032) 1px, transparent 1px);
+      background-size: 48px 48px;
+    }
+
+    /* ── Vignettes ──────────────────────────────────────────────────────────── */
+    #vignette-left {
+      position: fixed; top: 0; left: 0; bottom: 0; width: 180px;
+      background: linear-gradient(to right, rgba(9,9,15,0.45), transparent);
+      pointer-events: none; z-index: 5;
+    }
+    #vignette-right {
+      position: fixed; top: 0; right: 0; bottom: 0; width: 180px;
+      background: linear-gradient(to left, rgba(9,9,15,0.45), transparent);
+      pointer-events: none; z-index: 5;
+    }
+
+    /* ── Focus hint ─────────────────────────────────────────────────────────── */
+    #reset-hint {
+      position: fixed; bottom: 26px; left: 50%;
+      transform: translateX(-50%);
+      color: rgba(127, 255, 212, 0);
+      font-size: 11px; letter-spacing: 0.2em; text-transform: lowercase;
+      transition: color 0.7s ease; pointer-events: none; z-index: 10;
+    }
+    #reset-hint.visible { color: rgba(127, 255, 212, 0.42); }
+
+    /* ── Meta: node/edge count ──────────────────────────────────────────────── */
+    #meta {
+      position: fixed; top: 16px; left: 50%; transform: translateX(-50%);
+      color: rgba(127, 255, 212, 0.18);
+      font-size: 10px; letter-spacing: 0.24em; z-index: 10; user-select: none;
+      white-space: nowrap;
+    }
+
+    /* ── Changes feed ───────────────────────────────────────────────────────── */
+    #changes {
+      position: fixed; top: 22px; left: 22px; z-index: 20;
+      background: rgba(8, 11, 22, 0.90);
+      border: 1px solid rgba(127, 255, 212, 0.10);
+      border-radius: 10px;
+      padding: 14px 16px; width: 300px; max-height: 40vh; overflow-y: auto;
+      scrollbar-width: thin;
+      scrollbar-color: rgba(127,255,212,0.15) transparent;
+    }
+
+    .change-row {
+      display: flex; align-items: baseline; gap: 8px; padding: 4px 0;
+      border-bottom: 1px solid rgba(127,255,212,0.05); font-size: 10px;
+      cursor: default; transition: background 0.15s;
+    }
+    .change-row:last-child { border-bottom: none; }
+    .change-row:hover { background: rgba(127,255,212,0.025); }
+    .change-ts { color: #7fffd4; flex-shrink: 0; letter-spacing: 0.05em; }
+    .change-op {
+      flex-shrink: 0; font-size: 8px; letter-spacing: 0.15em; text-transform: uppercase;
+      padding: 1px 5px; border-radius: 2px;
+    }
+    .change-op.inserted { background: rgba(127,255,180,0.15); color: #7fcc7f; }
+    .change-op.updated  { background: rgba(212,168,90,0.15);  color: #d4a85a; }
+    .change-op.deleted  { background: rgba(224,124,124,0.15); color: #e07c7c; }
+    .change-label { color: rgba(190,205,225,0.75); flex: 1; min-width: 0;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .change-detail { color: #7fffd4; flex-shrink: 0; font-size: 9px; }
+
+    /* ── Legend panel ───────────────────────────────────────────────────────── */
+    #legend {
+      position: fixed; bottom: 22px; left: 22px; z-index: 20;
+      background: rgba(8, 11, 22, 0.90);
+      border: 1px solid rgba(127, 255, 212, 0.10);
+      border-radius: 10px;
+      min-width: 230px; max-height: 40vh; overflow: hidden;
+    }
+
+    #legend-header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 10px 16px 8px;
+      border-bottom: 1px solid rgba(127,255,212,0.06);
+    }
+    #legend-toggle {
+      background: none; border: none; cursor: pointer;
+      color: rgba(127,255,212,0.40); font-size: 14px; line-height: 1;
+      padding: 0 2px; transition: color 0.2s;
+    }
+    #legend-toggle:hover { color: rgba(127,255,212,0.75); }
+
+    #legend-body {
+      overflow-y: auto; padding: 4px 16px 14px;
+      max-height: calc(40vh - 40px);
+      scrollbar-width: thin;
+      scrollbar-color: rgba(127,255,212,0.15) transparent;
+    }
+
+    .legend-section-title {
+      color: #7fffd4; font-size: 9px; letter-spacing: 0.32em;
+      text-transform: uppercase; margin-top: 12px; margin-bottom: 6px;
+    }
+    .legend-section-title:first-child { margin-top: 6px; }
+
+    .legend-row {
+      display: flex; align-items: center; gap: 8px; padding: 3px 4px;
+      color: rgba(190, 205, 225, 0.65); font-size: 10px; letter-spacing: 0.07em;
+      border-radius: 3px; cursor: pointer; transition: background 0.15s;
+    }
+    .legend-row:hover { background: rgba(127,255,212,0.06); }
+    .legend-row.active {
+      background: rgba(127,255,212,0.10);
+      outline: 1px solid rgba(127,255,212,0.22);
+    }
+    .swatch {
+      width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
+      box-shadow: 0 0 4px currentColor;
+    }
+
+    .legend-top-row {
+      display: flex; align-items: center; gap: 8px; padding: 3px 4px;
+      font-size: 10px; letter-spacing: 0.06em; border-radius: 3px;
+      cursor: pointer; transition: background 0.15s;
+    }
+    .legend-top-row:hover { background: rgba(127,255,212,0.06); }
+    .legend-top-rank { color: rgba(127,255,212,0.45); font-size: 9px; width: 20px; flex-shrink: 0; }
+    .legend-top-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .legend-top-deg  { margin-left: auto; font-size: 9px; color: rgba(127,255,212,0.4); padding-left: 8px; flex-shrink: 0; }
+
+    /* ── Voice waveform ─────────────────────────────────────────────────────── */
+    #waveform {
+      position: relative; height: 100px;
+      border-bottom: 1px solid rgba(127,255,212,0.08);
+      flex-shrink: 0; overflow: hidden; cursor: pointer;
+    }
+    .wf-label {
+      position: absolute; top: 10px; left: 14px; z-index: 1;
+      font-size: 8px; letter-spacing: 0.32em; text-transform: uppercase;
+      color: rgba(127,255,212,0.28); pointer-events: none;
+    }
+    #wf-dot {
+      position: absolute; top: 13px; right: 14px; z-index: 1;
+      width: 7px; height: 7px; border-radius: 50%;
+      background: #d4a85a; box-shadow: 0 0 6px #d4a85a;
+      transition: background 0.5s, box-shadow 0.5s; pointer-events: none;
+    }
+    #sound-toggle {
+      position: absolute; bottom: 8px; left: 10px; z-index: 2;
+      background: none; border: none; cursor: pointer;
+      color: rgba(127,255,212,0.18); font-size: 13px; line-height: 1;
+      padding: 2px; transition: color 0.3s;
+    }
+    #sound-toggle:hover { color: rgba(127,255,212,0.50); }
+    #sound-toggle.enabled { color: rgba(127,255,212,0.55); }
+    #waveform-canvas {
+      position: absolute; inset: 0; width: 100%; height: 100%;
+    }
+
+    /* ── Chat panel ─────────────────────────────────────────────────────────── */
+    #chat {
+      position: fixed; right: 0; bottom: 0;
+      width: 380px; height: 100px;
+      overflow: hidden;
+      background: rgba(8, 11, 22, 0.92);
+      border-left: 1px solid rgba(127, 255, 212, 0.10);
+      border-top: 1px solid rgba(127, 255, 212, 0.10);
+      border-radius: 10px 0 0 0;
+      display: flex; flex-direction: column;
+      transition: height 0.38s cubic-bezier(0.4, 0, 0.2, 1);
+      z-index: 20;
+    }
+    #chat.chat-open { height: 100vh; }
+
+    /* ── Chat messages area ─────────────────────────────────────────────────── */
+    #chat-messages {
+      flex: 1; overflow-y: auto;
+      padding: 14px 16px;
+      display: flex; flex-direction: column; gap: 10px;
+      scrollbar-width: thin;
+      scrollbar-color: rgba(127,255,212,0.15) transparent;
+      position: relative;
+    }
+
+    /* Empty state */
+    #chat-empty {
+      position: absolute; inset: 0;
+      display: flex; align-items: center; justify-content: center;
+      color: rgba(127,255,212,0.13);
+      font-family: 'DM Mono', 'Courier New', monospace;
+      font-size: 11px; letter-spacing: 0.08em;
+      pointer-events: none; user-select: none;
+    }
+
+    /* Message bubbles */
+    @keyframes msgSlideIn {
+      from { opacity: 0; transform: translateY(8px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+
+    .msg {
+      display: flex; flex-direction: column;
+      max-width: 90%;
+      animation: msgSlideIn 0.32s ease forwards;
+    }
+    .msg-user    { align-self: flex-end;   align-items: flex-end; }
+    .msg-assistant { align-self: flex-start; align-items: flex-start; }
+
+    .msg-text {
+      padding: 7px 11px; border-radius: 10px;
+      word-break: break-word; line-height: 1.5;
+    }
+    .msg-user .msg-text {
+      background: rgba(127,255,212,0.08);
+      color: #7fffd4;
+      font-family: 'DM Mono', 'Courier New', monospace;
+      font-size: 11px;
+      border-bottom-right-radius: 3px;
+    }
+    .msg-assistant .msg-text {
+      background: rgba(106,143,216,0.08);
+      color: rgba(190,205,225,0.88);
+      font-family: 'DM Mono', 'Courier New', monospace;
+      font-size: 11px;
+      border-bottom-left-radius: 3px;
+    }
+    .msg-assistant .msg-text:empty::after {
+      content: '▍'; opacity: 0.5; animation: blink 1s step-end infinite;
+    }
+    .msg-error .msg-text { color: #e07c7c !important; }
+
+    .msg-tool {
+      align-self: flex-start;
+      animation: msgSlideIn 0.32s ease forwards;
+    }
+    .msg-tool-badge {
+      font-size: 9px; letter-spacing: 0.14em; text-transform: uppercase;
+      color: #7fcc7f; background: rgba(127,255,180,0.07);
+      padding: 2px 7px; border-radius: 2px;
+    }
+
+    /* ── Chat input row ─────────────────────────────────────────────────────── */
+    #chat-input-row {
+      display: flex; align-items: center; gap: 8px;
+      border-top: 1px solid rgba(127,255,212,0.08);
+      padding: 10px 12px; flex-shrink: 0;
+    }
+    #chat-input {
+      flex: 1; background: transparent; border: none; outline: none;
+      color: rgba(190,205,225,0.85); font-family: 'DM Mono', 'Courier New', monospace;
+      font-size: 11px; letter-spacing: 0.06em; caret-color: #7fffd4;
+    }
+    #chat-input::placeholder { color: rgba(127,255,212,0.22); }
+    #chat-input:disabled { opacity: 0.35; }
+    #chat-send {
+      background: none; border: 1px solid rgba(127,255,212,0.15);
+      color: #7fffd4; font-family: inherit; font-size: 14px;
+      padding: 2px 9px; cursor: pointer; border-radius: 2px;
+      transition: background 0.15s;
+    }
+    #chat-send:hover    { background: rgba(127,255,212,0.08); }
+    #chat-send:disabled { opacity: 0.25; cursor: default; }
+
+    @keyframes blink { 50% { opacity: 0; } }
+  </style>
+</head>
+<body>
+  <div id="graph"></div>
+  <div id="vignette-left"></div>
+  <div id="vignette-right"></div>
+  <div id="reset-hint">click anywhere to reset</div>
+  <div id="meta">connecting…</div>
+
+  <!-- Changes feed: top-left -->
+  <div id="changes"></div>
+
+  <!-- Legend: bottom-left -->
+  <div id="legend">
+    <div id="legend-header">
+      <span class="legend-section-title" style="margin:0">My Memories</span>
+      <button id="legend-toggle" title="collapse">‹</button>
+    </div>
+    <div id="legend-body">
+      <div id="legend-colors"></div>
+      <div id="legend-top5"></div>
+    </div>
+  </div>
+
+  <audio id="ambient-audio" src="/lib/713055__muyo5438__pleasant-atmosphere.mp3" loop preload="auto"></audio>
+
+  <!-- Chat panel: right edge -->
+  <div id="chat">
+    <div id="waveform">
+      <span class="wf-label">VOICE RESPONSE</span>
+      <span id="wf-dot"></span>
+      <button id="sound-toggle" title="enable sound">♪</button>
+      <canvas id="waveform-canvas"></canvas>
+    </div>
+    <div id="chat-messages">
+      <div id="chat-empty">memory is listening</div>
+    </div>
+    <div id="chat-input-row">
+      <input id="chat-input" type="text"
+             placeholder="type to chat — /v to speak"
+             autocomplete="off" spellcheck="false">
+      <button id="chat-send">↵</button>
+    </div>
+  </div>
+
+  <script>
+    // ── Palette ──────────────────────────────────────────────────────────────
+    const TYPE_COLORS = {
+      'entity:person':         '#7fffd4',
+      'entity:place':          '#6a8fd8',
+      'entity:org':            '#9b8ed6',
+      'entity:object':         '#5ab4d6',
+      'entity:concept':        '#a3d9b1',
+      'entity:digital_object': '#7ecfeb',
+      'event:delivery':        '#e07c7c',
+      'event:meeting':         '#e07c7c',
+      'event:conversation':    '#e07c7c',
+      'event:transaction':     '#e07c7c',
+      'event:state_change':    '#e07c7c',
+      'commitment:planned':    '#d4a85a',
+      'commitment:confirmed':  '#d4a85a',
+      'commitment:completed':  '#7fcc7f',
+      'commitment:cancelled':  '#55566a',
+    };
+    const DEFAULT_COLOR = '#8888aa';
+    const nodeColor = t => TYPE_COLORS[t] || DEFAULT_COLOR;
+
+    // COLOR_GROUPS drive the legend — each has a match function for filtering
+    const COLOR_GROUPS = [
+      { color: '#7fffd4', label: 'Person',                       match: t => t === 'entity:person' },
+      { color: '#6a8fd8', label: 'Place',                        match: t => t === 'entity:place' },
+      { color: '#9b8ed6', label: 'Organisation',                 match: t => t === 'entity:org' },
+      { color: '#5ab4d6', label: 'Object',                       match: t => t === 'entity:object' },
+      { color: '#a3d9b1', label: 'Concept',                      match: t => t === 'entity:concept' },
+      { color: '#7ecfeb', label: 'Digital Object',               match: t => t === 'entity:digital_object' },
+      { color: '#e07c7c', label: 'Event',                        match: t => t.startsWith('event:') },
+      { color: '#d4a85a', label: 'Commitment — Planned/Confirmed', match: t => t === 'commitment:planned' || t === 'commitment:confirmed' },
+      { color: '#7fcc7f', label: 'Commitment — Completed',       match: t => t === 'commitment:completed' },
+      { color: '#55566a', label: 'Commitment — Cancelled',       match: t => t === 'commitment:cancelled' },
+    ];
+
+    // ── Icon map & loader ─────────────────────────────────────────────────────
+    const TYPE_ICON = {
+      'entity:person':   'person',
+      'entity:place':    'place',
+      'entity:org':      'org',
+      'entity:object':   'object',
+      'entity:concept':  'concept',
+      'event:delivery':  'event',
+      'event:meeting':   'event',
+      'event:conversation': 'event',
+      'event:transaction':  'event',
+      'event:state_change': 'event',
+    };
+    const SVG_URLS = {
+      person: '/svg/person-svgrepo-com.svg',
+      place:  '/svg/place-marker-svgrepo-com.svg',
+      event:  '/svg/event-svgrepo-com.svg',
+      object: '/svg/apple-svgrepo-com.svg',
+      concept:'/svg/box-svgrepo-com.svg',
+      org:    '/svg/building-08-svgrepo-com.svg',
+    };
+    const svgContent = {};
+
+    async function loadIcons() {
+      await Promise.all(Object.entries(SVG_URLS).map(async ([key, url]) => {
+        try { svgContent[key] = await fetch(url).then(r => r.text()); } catch (_) {}
+      }));
+    }
+
+    function coloredSvgUrl(iconKey, color) {
+      const raw = svgContent[iconKey];
+      if (!raw) return null;
+      const colored = raw
+        .replace(/fill="#000000"/g, `fill="${color}"`)
+        .replace(/stroke="#000000"/g, `stroke="${color}"`);
+      return 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(colored);
+    }
+
+    // ── DataSets ──────────────────────────────────────────────────────────────
+    const MIN_SIZE = 9, MAX_SIZE = 32;
+    const visNodes = new vis.DataSet([]);
+    const visEdges = new vis.DataSet([]);
+    let maxDegree  = 1;
+
+    // ── Network ───────────────────────────────────────────────────────────────
+    const network = new vis.Network(document.getElementById('graph'), { nodes: visNodes, edges: visEdges }, {
+      physics: {
+        solver: 'forceAtlas2Based',
+        forceAtlas2Based: { gravitationalConstant: -80, springLength: 150, springConstant: 0.04, damping: 0.6 },
+        stabilization: { iterations: 100, updateInterval: 10 },
+        maxVelocity: 50, minVelocity: 0.25,
+      },
+      interaction: { hover: true, tooltipDelay: 9999999, hideEdgesOnDrag: false, zoomView: true, dragNodes: true },
+      nodes: { borderWidth: 0, borderWidthSelected: 2 },
+      edges: { smooth: { type: 'dynamic' }, selectionWidth: 0 },
+    });
+
+    // ── Stabilisation ─────────────────────────────────────────────────────────
+    let stabilised = false;
+    network.on('stabilizationIterationsDone', () => {
+      stabilised = true;
+      network.setOptions({ physics: { enabled: false } });
+    });
+
+    // ── Hover: show / hide label ──────────────────────────────────────────────
+    let focusedNode = null;
+    let focusedEdge = null;
+    let top20Ids    = new Set();
+
+    network.on('hoverNode', ({ node }) => {
+      if (focusedNode !== null) return;
+      const n = visNodes.get(node);
+      visNodes.update({ id: node, label: n._label,
+        font: { size: 13, color: n._color, face: 'DM Mono, Courier New, monospace', strokeWidth: 0 } });
+    });
+    network.on('blurNode', ({ node }) => {
+      if (focusedNode !== null) return;
+      if (top20Ids.has(node)) return;
+      visNodes.update({ id: node, label: '', font: { size: 0 } });
+    });
+
+    // ── Click: focus / reset ──────────────────────────────────────────────────
+    network.on('click', params => {
+      if (params.nodes.length > 0) {
+        clearEdgeFocus();
+        const id = params.nodes[0];
+        focusedNode === id ? resetFocus() : applyFocus(id);
+      } else if (params.edges.length > 0) {
+        const id = params.edges[0];
+        focusedEdge === id ? clearEdgeFocus() : applyEdgeFocus(id);
+      } else {
+        clearEdgeFocus();
+        resetFocus();
+      }
+    });
+
+    function applyEdgeFocus(edgeId) {
+      if (focusedEdge !== null) clearEdgeFocus();
+      focusedEdge = edgeId;
+      const e = visEdges.get(edgeId);
+      visEdges.update({ id: edgeId, label: e._type,
+        font: { size: 11, color: '#7fffd4', face: 'DM Mono, Courier New, monospace',
+                strokeWidth: 3, strokeColor: '#09090f' } });
+    }
+    function clearEdgeFocus() {
+      if (focusedEdge === null) return;
+      visEdges.update({ id: focusedEdge, label: '', font: { size: 0 } });
+      focusedEdge = null;
+    }
+
+    function applyFocus(nodeId) {
+      focusedNode = nodeId;
+      const neighbours     = new Set(network.getConnectedNodes(nodeId));
+      neighbours.add(nodeId);
+      const connectedEdges = new Set(network.getConnectedEdges(nodeId));
+      visNodes.update(visNodes.getIds().map(id => {
+        const n = visNodes.get(id), show = neighbours.has(id);
+        return { id, hidden: !show, label: show ? n._label : '',
+          font: { size: show ? 13 : 0, color: n._color, face: 'DM Mono, Courier New, monospace', strokeWidth: 0 } };
+      }));
+      visEdges.update(visEdges.getIds().map(id => ({ id, hidden: !connectedEdges.has(id) })));
+      document.getElementById('reset-hint').classList.add('visible');
+    }
+
+    function resetFocus() {
+      if (focusedNode === null) return;
+      clearEdgeFocus();
+      focusedNode = null;
+      visNodes.update(visNodes.getIds().map(id => ({ id, hidden: false, label: '', font: { size: 0 } })));
+      visEdges.update(visEdges.getIds().map(id => ({ id, hidden: false })));
+      applyTop20Labels();
+      document.getElementById('reset-hint').classList.remove('visible');
+    }
+
+    function applyTop20Labels() {
+      const updates = [...top20Ids].map(id => {
+        const n = visNodes.get(id);
+        if (!n) return null;
+        return { id, label: n._label,
+          font: { size: 13, color: n._color, face: 'DM Mono, Courier New, monospace', strokeWidth: 0 } };
+      }).filter(Boolean);
+      if (updates.length) visNodes.update(updates);
+    }
+
+    // ── Legend type filter ────────────────────────────────────────────────────
+    let activeTypeFilter = null;   // index into COLOR_GROUPS, or null
+
+    function applyTypeFilter(idx, allNodes, allEdges) {
+      if (idx === null) {
+        // Clear filter
+        visNodes.update(allNodes.map(n => ({ id: n.id, hidden: false })));
+        visEdges.update(allEdges.map(e => ({ id: e.id, hidden: false })));
+        if (!focusedNode) applyTop20Labels();
+        return;
+      }
+      const matchFn = COLOR_GROUPS[idx].match;
+      const visibleIds = new Set(allNodes.filter(n => matchFn(n.type_tag)).map(n => n.id));
+      visNodes.update(allNodes.map(n => ({ id: n.id, hidden: !visibleIds.has(n.id), label: visibleIds.has(n.id) ? n.label : '', font: { size: visibleIds.has(n.id) ? 13 : 0 } })));
+      visEdges.update(allEdges.map(e => ({ id: e.id, hidden: !(visibleIds.has(e.from) || visibleIds.has(e.to)) })));
+    }
+
+    // ── Vis.js node/edge builders ─────────────────────────────────────────────
+    const AGE_MAX_MS = 30 * 24 * 60 * 60 * 1000;   // 30 days
+
+    function buildVisNode(n) {
+      const c    = nodeColor(n.type_tag);
+      const size = MIN_SIZE + (n.degree / maxDegree) * (MAX_SIZE - MIN_SIZE);
+      const base = { id: n.id, _label: n.label, _color: c, label: '',
+        size, borderWidth: 0, borderWidthSelected: 2,
+        font: { size: 0, color: c, face: 'DM Mono, Courier New, monospace', strokeWidth: 0 } };
+      const iconKey = TYPE_ICON[n.type_tag];
+      const imgUrl  = iconKey ? coloredSvgUrl(iconKey, c) : null;
+      if (imgUrl) {
+        return { ...base, shape: 'image', image: imgUrl,
+          color: { border: c, highlight: { border: c }, hover: { border: c } } };
+      }
+      return { ...base, shape: 'dot',
+        color: { background: c, border: c,
+          highlight: { background: '#ffffff', border: c },
+          hover:      { background: c, border: '#ffffff' } },
+        shadow: { enabled: true, color: c + '55', size: 14, x: 0, y: 0 } };
+    }
+
+    function buildVisEdge(e) {
+      // Opacity by recency: fresh = vivid, old = dim
+      let alpha = 0.18;
+      if (e.created_at) {
+        const age       = Date.now() - new Date(e.created_at).getTime();
+        const freshness = Math.max(0, 1 - age / AGE_MAX_MS);
+        alpha = 0.07 + freshness * 0.30;
+      }
+      const aStr = alpha.toFixed(2);
+      return {
+        id: e.id, from: e.from, to: e.to, _type: e.type,
+        color: {
+          color:     `rgba(110, 120, 175, ${aStr})`,
+          highlight: 'rgba(200, 215, 255, 0.55)',
+          hover:     'rgba(200, 215, 255, 0.40)',
+        },
+        width: 1, selectionWidth: 0,
+        smooth: { type: 'dynamic' },
+        arrows: { to: { enabled: true, scaleFactor: 0.35 } },
+      };
+    }
+
+    // ── Node pulse tracking ───────────────────────────────────────────────────
+    const nodeAges     = new Map();   // nodeId → birth timestamp
+    const PULSE_DURATION = 2200;
+
+    // ── Label → node ID map (for changes feed hover glow) ─────────────────────
+    const labelToNodeId = new Map();
+
+    // ── Fingerprint-based change detection ────────────────────────────────────
+    let lastFingerprint = null;
+    let latestGraphData = { nodes: [], edges: [] };
+
+    function fingerprint(data) {
+      const ns = [...data.nodes].sort((a, b) => (a.id < b.id ? -1 : 1))
+        .map(n => `${n.id}|${n.label}|${n.type_tag}|${n.degree}`).join(',');
+      const es = [...data.edges].sort((a, b) => (a.id < b.id ? -1 : 1))
+        .map(e => `${e.id}|${e.from}|${e.to}|${e.type}`).join(',');
+      return ns + '::' + es;
+    }
+
+    // ── Live polling ──────────────────────────────────────────────────────────
+    async function refreshGraph() {
+      let data;
+      try { data = await fetch('/graph').then(r => r.json()); } catch (_) { return; }
+
+      const fp = fingerprint(data);
+      if (fp === lastFingerprint) return;
+      lastFingerprint = fp;
+      latestGraphData = data;
+
+      // Rebuild label→id map
+      labelToNodeId.clear();
+      data.nodes.forEach(n => labelToNodeId.set(n.label, n.id));
+
+      maxDegree = Math.max(...data.nodes.map(n => n.degree), 1);
+
+      const existingNodeIds = new Set(visNodes.getIds());
+      const existingEdgeIds = new Set(visEdges.getIds());
+      const newNodeIds      = new Set(data.nodes.map(n => n.id));
+      const newEdgeIds      = new Set(data.edges.map(e => e.id));
+
+      const toRemoveNodes = [...existingNodeIds].filter(id => !newNodeIds.has(id));
+      const toAddNodes    = data.nodes.filter(n => !existingNodeIds.has(n.id));
+      const toUpdateNodes = data.nodes.filter(n =>  existingNodeIds.has(n.id));
+      const toRemoveEdges = [...existingEdgeIds].filter(id => !newEdgeIds.has(id));
+      const toAddEdges    = data.edges.filter(e => !existingEdgeIds.has(e.id));
+
+      if (toRemoveNodes.length) visNodes.remove(toRemoveNodes);
+      if (toAddNodes.length)    visNodes.add(toAddNodes.map(buildVisNode));
+      if (toUpdateNodes.length) visNodes.update(toUpdateNodes.map(buildVisNode));
+      if (toRemoveEdges.length) visEdges.remove(toRemoveEdges);
+      if (toAddEdges.length)    visEdges.add(toAddEdges.map(buildVisEdge));
+
+      // Track new nodes for pulse animation
+      toAddNodes.forEach(n => nodeAges.set(n.id, Date.now()));
+
+      // Reapply type filter if active
+      if (activeTypeFilter !== null) {
+        applyTypeFilter(activeTypeFilter, data.nodes, data.edges);
+      } else if (!focusedNode) {
+        top20Ids = new Set(
+          data.nodes.slice().sort((a, b) => b.degree - a.degree).slice(0, 20).map(n => n.id)
+        );
+        applyTop20Labels();
+      }
+
+      if (toAddNodes.length > 0) {
+        stabilised = false;
+        network.setOptions({ physics: { enabled: true } });
+      }
+
+      document.getElementById('meta').textContent =
+        data.nodes.length + ' nodes  ·  ' + data.edges.length + ' edges';
+
+      renderLegend(data.nodes);
+    }
+
+    // ── Voice waveform controller ─────────────────────────────────────────────
+    const waveform = (() => {
+      const canvas = document.getElementById('waveform-canvas');
+      const dot    = document.getElementById('wf-dot');
+      const ctx    = canvas.getContext('2d');
+      const dpr    = window.devicePixelRatio || 1;
+
+      function resize() {
+        const r = canvas.parentElement.getBoundingClientRect();
+        canvas.width  = r.width  * dpr;
+        canvas.height = r.height * dpr;
+        ctx.scale(dpr, dpr);
+      }
+      resize();
+      new ResizeObserver(resize).observe(canvas.parentElement);
+
+      const WAVES = [
+        { freq: 0.9,  phase: 0.0, speed: 0.40, color: '#7fffd4' },
+        { freq: 1.25, phase: 2.2, speed: 0.60, color: '#6a8fd8' },
+        { freq: 1.05, phase: 4.1, speed: 0.50, color: '#9b8ed6' },
+      ];
+      const DOT_COLORS = {
+        idle:       { bg: '#d4a85a', glow: '#d4a85a' },
+        listening:  { bg: '#7fffd4', glow: '#7fffd4' },
+        thinking:   { bg: '#6a8fd8', glow: '#6a8fd8' },
+        responding: { bg: '#7fffd4', glow: '#7fffd4' },
+      };
+      const AMP_TARGETS  = { idle: 0.12, listening: 0.72, thinking: 0.35, responding: 0.55 };
+      const SPEED_MUL    = { idle: 0.4,  listening: 1.6,  thinking: 0.9,  responding: 1.2 };
+
+      let state = 'idle', targetAmp = 0.12, curAmp = 0.12, t = 0;
+
+      function setState(s) {
+        state     = s;
+        targetAmp = AMP_TARGETS[s] ?? 0.12;
+        const dc  = DOT_COLORS[s];
+        if (dc) { dot.style.background = dc.bg; dot.style.boxShadow = `0 0 7px ${dc.glow}`; }
+      }
+
+      function draw() {
+        const W = canvas.width / dpr, H = canvas.height / dpr;
+        const breathe = state === 'idle' ? 0.04 * Math.sin(t * 0.30) : 0;
+        curAmp += (targetAmp - curAmp) * 0.04;
+        const amp      = curAmp + breathe;
+        const centerY  = H / 2, halfH = H / 2;
+        const speedMul = SPEED_MUL[state] ?? 1;
+
+        ctx.clearRect(0, 0, W, H);
+        WAVES.forEach(wave => {
+          ctx.save();
+          ctx.shadowBlur  = 11; ctx.shadowColor = wave.color;
+          ctx.strokeStyle = wave.color; ctx.lineWidth = 1.5; ctx.globalAlpha = 0.78;
+          ctx.beginPath();
+          for (let x = 0; x <= W; x++) {
+            const angle = (x / W) * Math.PI * 2 * wave.freq * 3 + wave.phase + t * wave.speed * speedMul;
+            const y = centerY + halfH * amp * Math.sin(angle);
+            x === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+          }
+          ctx.stroke();
+          ctx.restore();
+        });
+        t += 0.016;
+      }
+      return { draw, setState };
+    })();
+
+    // ── Animation loop ────────────────────────────────────────────────────────
+    function tick() {
+      requestAnimationFrame(tick);
+      waveform.draw();
+      if (stabilised) network.redraw();
+    }
+    requestAnimationFrame(tick);
+
+    // ── Canvas: breathing halo + node pulse rings ─────────────────────────────
+    network.on('afterDrawing', ctx => {
+      const now     = performance.now();
+      const breathe = 0.45 + 0.35 * Math.sin(now * 0.00075);
+
+      visNodes.forEach(n => {
+        if (n.hidden) return;
+        const pos = network.getPosition(n.id);
+        if (!pos) return;
+
+        // Breathing halo
+        ctx.save();
+        ctx.globalAlpha = breathe * 0.10;
+        ctx.fillStyle   = n._color;
+        ctx.beginPath();
+        ctx.arc(pos.x, pos.y, n.size * 1.75, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+      });
+
+      // Node pulse rings for newly added nodes
+      nodeAges.forEach((birthTime, id) => {
+        const age = Date.now() - birthTime;
+        if (age > PULSE_DURATION) { nodeAges.delete(id); return; }
+        const n = visNodes.get(id);
+        if (!n || n.hidden) return;
+        const pos = network.getPosition(id);
+        if (!pos) return;
+        const progress = age / PULSE_DURATION;
+        const radius   = n.size * (1.4 + progress * 2.8);
+        const alpha    = (1 - progress) * 0.55;
+        ctx.save();
+        ctx.globalAlpha = alpha;
+        ctx.strokeStyle = n._color;
+        ctx.lineWidth   = 1.8;
+        ctx.shadowBlur  = 10; ctx.shadowColor = n._color;
+        ctx.beginPath();
+        ctx.arc(pos.x, pos.y, radius, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.restore();
+      });
+    });
+
+    // ── Changes feed ──────────────────────────────────────────────────────────
+    let lastChangeId = -1;
+    const changesEl  = document.getElementById('changes');
+
+    // Hover glow: delegate on parent
+    let hoveredNodeId = null;
+    changesEl.addEventListener('mouseover', e => {
+      const row = e.target.closest('.change-row');
+      if (!row) return;
+      const nodeId = row.dataset.nodeId;
+      if (!nodeId || nodeId === hoveredNodeId) return;
+      // Restore previous
+      if (hoveredNodeId) restoreNodeGlow(hoveredNodeId);
+      hoveredNodeId = nodeId;
+      const n = visNodes.get(nodeId);
+      if (n) {
+        visNodes.update({ id: nodeId, shadow: { enabled: true, color: n._color + 'cc', size: 28, x: 0, y: 0 } });
+        network.redraw();
+      }
+    });
+    changesEl.addEventListener('mouseout', e => {
+      const row = e.target.closest('.change-row');
+      if (!row) return;
+      const nodeId = row.dataset.nodeId;
+      if (nodeId) { restoreNodeGlow(nodeId); hoveredNodeId = null; }
+    });
+
+    function restoreNodeGlow(nodeId) {
+      const n = visNodes.get(nodeId);
+      if (n) {
+        visNodes.update({ id: nodeId, shadow: { enabled: true, color: n._color + '55', size: 14, x: 0, y: 0 } });
+        network.redraw();
+      }
+    }
+
+    async function refreshChanges() {
+      try {
+        const data = await fetch('/changes').then(r => r.json());
+        if (!data.length || data[0].id === lastChangeId) return;
+        lastChangeId = data[0].id;
+        changesEl.innerHTML = data.map(c => {
+          const nodeId = labelToNodeId.get(c.label) || '';
+          return `<div class="change-row" data-node-id="${nodeId}">
+            <span class="change-ts">${c.ts}</span>
+            <span class="change-op ${c.operation}">${c.operation}</span>
+            <span class="change-label">${c.label}</span>
+            <span class="change-detail">${c.detail}</span>
+          </div>`;
+        }).join('');
+      } catch (_) {}
+    }
+
+    // ── Legend ────────────────────────────────────────────────────────────────
+    let colorKeyRendered = false;
+    let legendBodyOpen   = true;
+    const legendBody     = document.getElementById('legend-body');
+    const legendToggle   = document.getElementById('legend-toggle');
+
+    legendToggle.addEventListener('click', () => {
+      legendBodyOpen = !legendBodyOpen;
+      legendBody.style.display = legendBodyOpen ? '' : 'none';
+      legendToggle.textContent = legendBodyOpen ? '‹' : '›';
+    });
+
+    function renderLegend(nodes) {
+      // Type colour rows (rendered once)
+      if (!colorKeyRendered) {
+        colorKeyRendered = true;
+        const el = document.getElementById('legend-colors');
+        el.innerHTML = '<div class="legend-section-title">Memory Types</div>';
+        COLOR_GROUPS.forEach((grp, idx) => {
+          const row = document.createElement('div');
+          row.className = 'legend-row';
+          row.dataset.groupIdx = idx;
+          row.innerHTML = `<span class="swatch" style="background:${grp.color};color:${grp.color}"></span><span>${grp.label}</span>`;
+          row.addEventListener('click', () => {
+            if (activeTypeFilter === idx) {
+              activeTypeFilter = null;
+              row.classList.remove('active');
+              applyTypeFilter(null, latestGraphData.nodes, latestGraphData.edges);
+            } else {
+              // Deactivate previous
+              el.querySelectorAll('.legend-row.active').forEach(r => r.classList.remove('active'));
+              activeTypeFilter = idx;
+              row.classList.add('active');
+              applyTypeFilter(idx, latestGraphData.nodes, latestGraphData.edges);
+            }
+          });
+          el.appendChild(row);
+        });
+      }
+
+      // Top 5 nodes (re-rendered on each graph update)
+      const top5  = [...nodes].filter(n => n.degree > 0).sort((a, b) => b.degree - a.degree).slice(0, 5);
+      const top5El = document.getElementById('legend-top5');
+      top5El.innerHTML = '<br><div class="legend-section-title">Top Memories</div>';
+      top5.forEach((n, i) => {
+        const color = nodeColor(n.type_tag);
+        const row   = document.createElement('div');
+        row.className = 'legend-top-row';
+        row.style.color = color;
+        row.innerHTML = `<span class="legend-top-rank">#${i + 1}</span><span class="legend-top-name">${n.label}</span><span class="legend-top-deg">${n.degree}</span>`;
+        row.addEventListener('click', () => { openChat(); applyFocus(n.id); });
+        top5El.appendChild(row);
+      });
+    }
+
+    // ── Chat open/close ───────────────────────────────────────────────────────
+    let chatOpen = false;
+    const chatEl    = document.getElementById('chat');
+    const chatInput = document.getElementById('chat-input');
+    const chatSend  = document.getElementById('chat-send');
+    const chatMsgs  = document.getElementById('chat-messages');
+    const chatEmpty = document.getElementById('chat-empty');
+    let   chatHasMessages = false;
+
+    function openChat() {
+      if (chatOpen) return;
+      chatOpen = true;
+      chatEl.classList.add('chat-open');
+      setTimeout(() => chatInput.focus(), 380);
+    }
+    function closeChat() {
+      if (!chatOpen) return;
+      chatOpen = false;
+      chatEl.classList.remove('chat-open');
+      chatInput.blur();
+    }
+
+    // Click waveform strip to toggle chat
+    document.getElementById('waveform').addEventListener('click', e => {
+      if (e.target.id === 'sound-toggle') return;
+      chatOpen ? closeChat() : openChat();
+    });
+
+    // ── Chat messaging ────────────────────────────────────────────────────────
+    function chatScroll() { chatMsgs.scrollTop = chatMsgs.scrollHeight; }
+
+    function appendMsg(role, text = '') {
+      if (!chatHasMessages) { chatHasMessages = true; chatEmpty.style.display = 'none'; }
+      const wrap = document.createElement('div');
+      wrap.className = 'msg msg-' + role;
+      const bubble = document.createElement('div');
+      bubble.className = 'msg-text';
+      bubble.textContent = text;
+      wrap.appendChild(bubble);
+      chatMsgs.appendChild(wrap);
+      chatScroll();
+      return bubble;  // return the inner bubble for streaming
+    }
+
+    function appendToolBadge(label) {
+      if (!chatHasMessages) { chatHasMessages = true; chatEmpty.style.display = 'none'; }
+      const wrap   = document.createElement('div');
+      wrap.className = 'msg msg-tool';
+      const badge  = document.createElement('div');
+      badge.className   = 'msg-tool-badge';
+      badge.textContent = '⊕ ' + label;
+      wrap.appendChild(badge);
+      chatMsgs.appendChild(wrap);
+      chatScroll();
+    }
+
+    async function sendChat() {
+      const text = chatInput.value.trim();
+      if (!text) return;
+      chatInput.value    = '';
+      chatInput.disabled = true;
+      chatSend.disabled  = true;
+
+      const isVoice    = (text === '/v');
+      const userBubble = appendMsg('user', isVoice ? '🎙 listening…' : text);
+      const asstBubble = appendMsg('assistant');
+
+      waveform.setState(isVoice ? 'listening' : 'thinking');
+      let firstToken = true;
+
+      try {
+        const resp = await fetch('/chat', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message: text }),
+        });
+        const reader  = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let   buf     = '';
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          const lines = buf.split('\n');
+          buf = lines.pop();
+
+          for (const line of lines) {
+            if (!line.startsWith('data: ')) continue;
+            let evt;
+            try { evt = JSON.parse(line.slice(6)); } catch (_) { continue; }
+
+            if (evt.type === 'status') {
+              userBubble.textContent = '🎙 ' + evt.text;
+              waveform.setState('listening');
+              chatScroll();
+            } else if (evt.type === 'transcript') {
+              userBubble.textContent = evt.text;
+              waveform.setState('thinking');
+              chatScroll();
+            } else if (evt.type === 'token') {
+              if (firstToken) { waveform.setState('responding'); firstToken = false; }
+              asstBubble.textContent += evt.text;
+              chatScroll();
+            } else if (evt.type === 'tool') {
+              appendToolBadge(evt.label);
+            } else if (evt.type === 'error') {
+              asstBubble.textContent = '⚠ ' + evt.text;
+              asstBubble.parentElement.classList.add('msg-error');
+            }
+          }
+        }
+      } catch (_) {
+        asstBubble.textContent = '⚠ connection error';
+        asstBubble.parentElement.classList.add('msg-error');
+      } finally {
+        waveform.setState('idle');
+        chatInput.disabled = false;
+        chatSend.disabled  = false;
+        chatInput.focus();
+      }
+    }
+
+    chatSend.addEventListener('click', sendChat);
+    chatInput.addEventListener('keydown', e => {
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChat(); }
+    });
+
+    // ── Global keyboard shortcuts ─────────────────────────────────────────────
+    document.addEventListener('keydown', e => {
+      // Esc: reset focus + close chat
+      if (e.code === 'Escape') {
+        resetFocus();
+        closeChat();
+        return;
+      }
+
+      // Space (not in chat input): trigger voice
+      if (e.code === 'Space' && document.activeElement !== chatInput) {
+        e.preventDefault();
+        openChat();
+        // Small delay to let the panel animate before sending
+        setTimeout(() => {
+          chatInput.value = '/v';
+          sendChat();
+        }, 50);
+        return;
+      }
+
+      // Any printable character (not in chat input): open chat, focus input
+      if (document.activeElement !== chatInput && !chatOpen &&
+          e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        openChat();
+        // Focus so the key lands in the input
+        setTimeout(() => chatInput.focus(), 50);
+      }
+    });
+
+    // ── Sound system ──────────────────────────────────────────────────────────
+    let soundEnabled = false;
+    const soundBtn   = document.getElementById('sound-toggle');
+    const ambientAudio = document.getElementById('ambient-audio');
+    ambientAudio.volume = 0;
+
+    function fadeAudio(from, to, ms, onDone) {
+      const steps    = 60;
+      const interval = ms / steps;
+      const delta    = (to - from) / steps;
+      let   current  = from;
+      ambientAudio.volume = Math.max(0, Math.min(1, from));
+      const timer = setInterval(() => {
+        current += delta;
+        ambientAudio.volume = Math.max(0, Math.min(1, current));
+        if ((delta >= 0 && current >= to) || (delta < 0 && current <= to)) {
+          clearInterval(timer);
+          ambientAudio.volume = Math.max(0, Math.min(1, to));
+          if (onDone) onDone();
+        }
+      }, interval);
+    }
+
+    soundBtn.addEventListener('click', e => {
+      e.stopPropagation();
+      soundEnabled = !soundEnabled;
+      soundBtn.classList.toggle('enabled', soundEnabled);
+      soundBtn.title = soundEnabled ? 'disable sound' : 'enable sound';
+      if (soundEnabled) {
+        ambientAudio.play().catch(() => {});
+        fadeAudio(0, 0.35, 2500);
+      } else {
+        fadeAudio(ambientAudio.volume, 0, 1200, () => ambientAudio.pause());
+      }
+    });
+
+    // ── Bootstrap ─────────────────────────────────────────────────────────────
+    loadIcons().then(() => {
+      refreshGraph();
+      refreshChanges();
+      setInterval(refreshGraph,   3000);
+      setInterval(refreshChanges, 3000);
+    });
+  </script>
+</body>
+</html>
