@@ -9,10 +9,15 @@
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     body { background: #09090f; overflow: hidden; font-family: 'DM Mono', 'Courier New', monospace; }
 
+    /* ── Spotlight blob canvas (behind everything) ──────────────────────────── */
+    #blob-canvas {
+      position: fixed; inset: 0; z-index: 0; pointer-events: none;
+    }
+
     /* ── Graph canvas ───────────────────────────────────────────────────────── */
     #graph {
       width: 100vw; height: 100vh;
-      background-color: #09090f;
+      background-color: transparent;
       background-image:
         linear-gradient(rgba(100, 130, 210, 0.032) 1px, transparent 1px),
         linear-gradient(90deg, rgba(100, 130, 210, 0.032) 1px, transparent 1px);
@@ -55,7 +60,24 @@
       background: rgba(8, 11, 22, 0.90);
       border: 1px solid rgba(127, 255, 212, 0.10);
       border-radius: 10px;
-      padding: 14px 16px; width: 300px; max-height: 40vh; overflow-y: auto;
+      width: 300px; overflow: hidden;
+    }
+
+    #changes-header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 10px 16px 8px;
+      border-bottom: 1px solid rgba(127,255,212,0.06);
+    }
+    #changes-toggle {
+      background: none; border: none; cursor: pointer;
+      color: rgba(127,255,212,0.40); font-size: 14px; line-height: 1;
+      padding: 0 2px; transition: color 0.2s;
+    }
+    #changes-toggle:hover { color: rgba(127,255,212,0.75); }
+
+    #changes-body {
+      overflow-y: auto; padding: 6px 16px 14px;
+      max-height: calc(40vh - 40px);
       scrollbar-width: thin;
       scrollbar-color: rgba(127,255,212,0.15) transparent;
     }
@@ -146,8 +168,8 @@
     }
     .wf-label {
       position: absolute; top: 10px; left: 14px; z-index: 1;
-      font-size: 8px; letter-spacing: 0.32em; text-transform: uppercase;
-      color: rgba(127,255,212,0.28); pointer-events: none;
+      font-size: 9px; letter-spacing: 0.32em; text-transform: uppercase;
+      color: #7fffd4; pointer-events: none;
     }
     #wf-dot {
       position: absolute; top: 13px; right: 14px; z-index: 1;
@@ -271,10 +293,28 @@
     #chat-send:hover    { background: rgba(127,255,212,0.08); }
     #chat-send:disabled { opacity: 0.25; cursor: default; }
 
+    #voice-btn {
+      background: none; border: none; cursor: pointer; flex-shrink: 0;
+      color: rgba(127,255,212,0.28); padding: 2px 4px;
+      transition: color 0.2s, filter 0.2s;
+      line-height: 0;
+    }
+    #voice-btn:hover:not(:disabled) { color: rgba(127,255,212,0.70); }
+    #voice-btn:disabled { opacity: 0.20; cursor: default; }
+    #voice-btn.active {
+      color: #7fffd4;
+      animation: micPulse 1.1s ease-in-out infinite;
+    }
+    @keyframes micPulse {
+      0%, 100% { filter: drop-shadow(0 0 3px rgba(127,255,212,0.45)); }
+      50%       { filter: drop-shadow(0 0 9px rgba(127,255,212,0.90)); }
+    }
+
     @keyframes blink { 50% { opacity: 0; } }
   </style>
 </head>
 <body>
+  <canvas id="blob-canvas"></canvas>
   <div id="graph"></div>
   <div id="vignette-left"></div>
   <div id="vignette-right"></div>
@@ -282,12 +322,18 @@
   <div id="meta">connecting…</div>
 
   <!-- Changes feed: top-left -->
-  <div id="changes"></div>
+  <div id="changes">
+    <div id="changes-header">
+      <span class="legend-section-title" style="margin:0">Change Log</span>
+      <button id="changes-toggle" title="collapse">‹</button>
+    </div>
+    <div id="changes-body"></div>
+  </div>
 
   <!-- Legend: bottom-left -->
   <div id="legend">
     <div id="legend-header">
-      <span class="legend-section-title" style="margin:0">My Memories</span>
+      <span class="legend-section-title" style="margin:0">Memories</span>
       <button id="legend-toggle" title="collapse">‹</button>
     </div>
     <div id="legend-body">
@@ -301,7 +347,7 @@
   <!-- Chat panel: right edge -->
   <div id="chat">
     <div id="waveform">
-      <span class="wf-label">VOICE RESPONSE</span>
+      <span class="wf-label">What's on your mind?</span>
       <span id="wf-dot"></span>
       <button id="sound-toggle" title="enable sound">♪</button>
       <canvas id="waveform-canvas"></canvas>
@@ -311,8 +357,16 @@
     </div>
     <div id="chat-input-row">
       <input id="chat-input" type="text"
-             placeholder="type to chat — /v to speak"
+             placeholder="type to chat"
              autocomplete="off" spellcheck="false">
+      <button id="voice-btn" title="voice input" aria-label="voice input">
+        <svg width="11" height="15" viewBox="0 0 11 15" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <rect x="3" y="0" width="5" height="8" rx="2.5" fill="currentColor"/>
+          <path d="M1 6.5C1 9.8 3 11.5 5.5 11.5S10 9.8 10 6.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" fill="none"/>
+          <line x1="5.5" y1="11.5" x2="5.5" y2="14" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+          <line x1="3.5" y1="14" x2="7.5" y2="14" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+        </svg>
+      </button>
       <button id="chat-send">↵</button>
     </div>
   </div>
@@ -402,8 +456,8 @@
       physics: {
         solver: 'forceAtlas2Based',
         forceAtlas2Based: { gravitationalConstant: -80, springLength: 150, springConstant: 0.04, damping: 0.6 },
-        stabilization: { iterations: 100, updateInterval: 10 },
-        maxVelocity: 50, minVelocity: 0.25,
+        stabilization: { iterations: 150, updateInterval: 10 },
+        maxVelocity: 50, minVelocity: 0.1,
       },
       interaction: { hover: true, tooltipDelay: 9999999, hideEdgesOnDrag: false, zoomView: true, dragNodes: true },
       nodes: { borderWidth: 0, borderWidthSelected: 2 },
@@ -708,6 +762,65 @@
     }
     requestAnimationFrame(tick);
 
+    // ── Spotlight blobs ───────────────────────────────────────────────────────
+    (function () {
+      const blobCanvas = document.getElementById('blob-canvas');
+      const bctx       = blobCanvas.getContext('2d');
+
+      function resizeBlob() {
+        blobCanvas.width  = window.innerWidth;
+        blobCanvas.height = window.innerHeight;
+      }
+      window.addEventListener('resize', resizeBlob);
+      resizeBlob();
+
+      // 4 blobs — colours from TYPE_COLORS palette
+      // x0/y0: base position as screen fraction
+      // ax/ay: drift amplitude (screen fraction)
+      // fx/fy: drift frequency (rad/ms) — one cycle every ~85–130 s
+      // ph:    phase offset so blobs spread across screen from startup
+      const BLOBS = [
+        { color: '#7fffd4', r: 0.30, x0: 0.22, y0: 0.28, ax: 0.16, ay: 0.12, fx: 1.1e-4, fy: 8.3e-5, ph: 0.0 },
+        { color: '#6a8fd8', r: 0.34, x0: 0.72, y0: 0.62, ax: 0.14, ay: 0.18, fx: 7.7e-5, fy: 1.2e-4, ph: 1.9 },
+        { color: '#9b8ed6', r: 0.26, x0: 0.52, y0: 0.18, ax: 0.19, ay: 0.11, fx: 1.0e-4, fy: 6.9e-5, ph: 3.5 },
+        { color: '#5ab4d6', r: 0.23, x0: 0.18, y0: 0.74, ax: 0.09, ay: 0.17, fx: 8.8e-5, fy: 1.1e-4, ph: 5.1 },
+      ];
+
+      // Pre-parse "#rrggbb" → "r,g,b" string once
+      function hexRgb(h) {
+        const n = parseInt(h.slice(1), 16);
+        return `${(n >> 16) & 255},${(n >> 8) & 255},${n & 255}`;
+      }
+      BLOBS.forEach(b => { b.rgb = hexRgb(b.color); });
+
+      let blobLast = 0;
+      function drawBlobs(now) {
+        requestAnimationFrame(drawBlobs);
+        if (now - blobLast < 33) return;   // ~30 fps — blobs move very slowly
+        blobLast = now;
+
+        const W = blobCanvas.width, H = blobCanvas.height;
+        bctx.clearRect(0, 0, W, H);
+
+        BLOBS.forEach(b => {
+          const x = (b.x0 + b.ax * Math.sin(now * b.fx + b.ph))       * W;
+          const y = (b.y0 + b.ay * Math.cos(now * b.fy + b.ph * 0.6)) * H;
+          const r = b.r * Math.min(W, H);
+
+          const g = bctx.createRadialGradient(x, y, 0, x, y, r);
+          g.addColorStop(0,   `rgba(${b.rgb}, 0.072)`);
+          g.addColorStop(0.4, `rgba(${b.rgb}, 0.038)`);
+          g.addColorStop(1,   `rgba(${b.rgb}, 0)`);
+
+          bctx.fillStyle = g;
+          bctx.beginPath();
+          bctx.arc(x, y, r, 0, Math.PI * 2);
+          bctx.fill();
+        });
+      }
+      requestAnimationFrame(drawBlobs);
+    })();
+
     // ── Canvas: breathing halo + node pulse rings ─────────────────────────────
     network.on('afterDrawing', ctx => {
       const now     = performance.now();
@@ -752,8 +865,16 @@
     });
 
     // ── Changes feed ──────────────────────────────────────────────────────────
-    let lastChangeId = -1;
-    const changesEl  = document.getElementById('changes');
+    let lastChangeId  = -1;
+    let changesBodyOpen = true;
+    const changesEl   = document.getElementById('changes-body');
+    const changesToggle = document.getElementById('changes-toggle');
+
+    changesToggle.addEventListener('click', () => {
+      changesBodyOpen = !changesBodyOpen;
+      changesEl.style.display = changesBodyOpen ? '' : 'none';
+      changesToggle.textContent = changesBodyOpen ? '‹' : '›';
+    });
 
     // Hover glow: delegate on parent
     let hoveredNodeId = null;
@@ -920,8 +1041,10 @@
       chatInput.value    = '';
       chatInput.disabled = true;
       chatSend.disabled  = true;
+      voiceBtn.disabled  = true;
 
       const isVoice    = (text === '/v');
+      if (isVoice) voiceBtn.classList.add('active');
       const userBubble = appendMsg('user', isVoice ? '🎙 listening…' : text);
       const asstBubble = appendMsg('assistant');
 
@@ -976,6 +1099,8 @@
         waveform.setState('idle');
         chatInput.disabled = false;
         chatSend.disabled  = false;
+        voiceBtn.disabled  = false;
+        voiceBtn.classList.remove('active');
         chatInput.focus();
       }
     }
@@ -985,24 +1110,25 @@
       if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChat(); }
     });
 
+    // ── Voice button ──────────────────────────────────────────────────────────
+    const voiceBtn = document.getElementById('voice-btn');
+    voiceBtn.addEventListener('click', () => {
+      if (voiceBtn.disabled) return;
+      if (!chatOpen) {
+        openChat();
+        setTimeout(() => { chatInput.value = '/v'; sendChat(); }, 50);
+      } else {
+        chatInput.value = '/v';
+        sendChat();
+      }
+    });
+
     // ── Global keyboard shortcuts ─────────────────────────────────────────────
     document.addEventListener('keydown', e => {
       // Esc: reset focus + close chat
       if (e.code === 'Escape') {
         resetFocus();
         closeChat();
-        return;
-      }
-
-      // Space (not in chat input): trigger voice
-      if (e.code === 'Space' && document.activeElement !== chatInput) {
-        e.preventDefault();
-        openChat();
-        // Small delay to let the panel animate before sending
-        setTimeout(() => {
-          chatInput.value = '/v';
-          sendChat();
-        }, 50);
         return;
       }
 

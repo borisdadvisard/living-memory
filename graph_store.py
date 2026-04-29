@@ -39,7 +39,7 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 DB_PATH       = Path(__file__).parent / "graph.db"
-EMBEDDING_DIM = int(os.getenv("LM_EMBEDDING_DIM", "768"))
+EMBEDDING_DIM = int(os.getenv("LM_EMBEDDING_DIM", "1024"))
 
 ENTITY_TYPES: frozenset[str] = frozenset({
     "person", "place", "org", "object", "concept", "digital_object",
@@ -376,7 +376,42 @@ class GraphStore:
                     self._conn.execute(stmt)
                 self._conn.execute(_HNSW_STMT)
 
+            # Auto-migrate if embedding dimension changed (e.g. nomic 768 → mxbai 1024).
+            # Graph data (entities/events/commitments/relations) is preserved;
+            # only the embeddings table is cleared — vectors are rebuilt lazily.
+            self._migrate_embedding_dim()
+
             log.debug("Schema initialised")
+
+    def _migrate_embedding_dim(self) -> None:
+        """
+        Drop and recreate the embeddings table + HNSW index if the stored
+        vector column dimension does not match the current EMBEDDING_DIM.
+        Called while self._lock is held.
+        """
+        try:
+            row = self._conn.execute(
+                "SELECT data_type FROM information_schema.columns "
+                "WHERE table_name = 'embeddings' AND column_name = 'vector'"
+            ).fetchone()
+            if row is None:
+                return  # table doesn't exist yet — nothing to do
+            stored_dim = int(row[0].replace("FLOAT[", "").replace("]", ""))
+            if stored_dim == EMBEDDING_DIM:
+                return  # already correct
+            log.info(
+                "Embedding dimension changed %d → %d — clearing embeddings table "
+                "(graph data preserved; vectors rebuilt lazily).",
+                stored_dim, EMBEDDING_DIM,
+            )
+            self._conn.execute("DROP INDEX IF EXISTS embeddings_vector_hnsw")
+            self._conn.execute("DROP TABLE IF EXISTS embeddings")
+            for stmt in _SCHEMA_STMTS:
+                if "embeddings" in stmt:
+                    self._conn.execute(stmt)
+            self._conn.execute(_HNSW_STMT)
+        except Exception as exc:
+            log.warning("_migrate_embedding_dim failed (non-fatal): %s", exc)
 
     def _run_migration(self) -> None:
         """
@@ -936,6 +971,47 @@ class GraphStore:
                 "object_type":  r[1],
                 "subtype":      r[2],
                 "display_name": r[3],
+            }
+            for r in rows
+        ]
+
+    def get_direct_relations(self, object_id: str, object_type: str) -> list[dict]:
+        """
+        Return all direct (1-hop) relations for a given object, including relation type
+        and the neighbor's display name. Used to build richer context lines.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT r.type AS rel_type,
+                       r.to_id::TEXT AS neighbor_id, r.to_type AS neighbor_type,
+                       COALESCE(e.name, ev.title, c.title) AS neighbor_name,
+                       'outgoing' AS direction
+                  FROM relations r
+                  LEFT JOIN entities    e  ON r.to_id = e.id AND r.to_type = 'entity'
+                  LEFT JOIN events      ev ON r.to_id = ev.id AND r.to_type = 'event'
+                  LEFT JOIN commitments c  ON r.to_id = c.id AND r.to_type = 'commitment'
+                 WHERE r.from_id::TEXT = ? AND r.from_type = ?
+                UNION ALL
+                SELECT r.type AS rel_type,
+                       r.from_id::TEXT AS neighbor_id, r.from_type AS neighbor_type,
+                       COALESCE(e.name, ev.title, c.title) AS neighbor_name,
+                       'incoming' AS direction
+                  FROM relations r
+                  LEFT JOIN entities    e  ON r.from_id = e.id AND r.from_type = 'entity'
+                  LEFT JOIN events      ev ON r.from_id = ev.id AND r.from_type = 'event'
+                  LEFT JOIN commitments c  ON r.from_id = c.id AND r.from_type = 'commitment'
+                 WHERE r.to_id::TEXT = ? AND r.to_type = ?
+                """,
+                [object_id, object_type, object_id, object_type],
+            ).fetchall()
+        return [
+            {
+                "rel_type":      r[0],
+                "neighbor_id":   r[1],
+                "neighbor_type": r[2],
+                "neighbor_name": r[3] or r[1],
+                "direction":     r[4],
             }
             for r in rows
         ]

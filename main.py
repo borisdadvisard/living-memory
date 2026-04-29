@@ -2,20 +2,25 @@
 main.py — Living Memory orchestration
 
 Start-up sequence:
-  1. Ensure Ollama is running (launchctl load if not)
-  2. Ensure nomic-embed-text is pulled
+  1. Ensure mlx-lm server is running on :8080 (started as subprocess if needed)
+  2. Load mlx-embeddings model in-process (mxbai-embed-large-v1, 1024-dim)
   3. Ensure kokoro_server.py is running on :8181
 
-Voice loop (per turn):
-  a. Record mic → Whisper STT → transcript
-  b. Build graph context (semantic search + name search + neighbors)
-  c. Call qwen3:30b with tool schemas (stream, think=False)
-  d. Parse tool calls → async graph writes + background embedding jobs
-  e. Print live graph growth counter
+Two-pass LLM architecture (per turn):
+  Pass 1 — silent, full tool schema:
+    Build graph context → call LLM with TOOLS → collect + apply tool calls
+    Text output discarded; no TTS; graph writes fire synchronously.
+  Pass 2 — speak-only, no tools, constrained:
+    Short SPEAK_PROMPT + tool_summary injected as context → stream to browser
+    For voice turns: each sentence streamed to Kokoro TTS as it arrives.
+    max_tokens=80 (voice) / 200 (text) → TTFT ~0.4s (no tool schema overhead).
+
+Background jobs:
+  Embedding generation fires after Pass 2 audio plays (no voice latency impact).
 
 GPU timeline:
-  whisper-cli subprocess exits → Ollama chat() starts → Kokoro on CPU
-  (no Metal contention; nomic-embed-text only fires after audio plays)
+  whisper-cli subprocess exits → mlx-lm Pass 1 → mlx-lm Pass 2 → Kokoro on CPU
+  (embeddings fire in background thread after audio completes)
 """
 
 import io
@@ -30,10 +35,12 @@ import time
 import wave
 from concurrent.futures import ThreadPoolExecutor
 
+import mlx.core as mx
 import numpy as np
-import ollama
 import requests
 import sounddevice as sd
+from mlx_embeddings.utils import load as mlx_embed_load, generate as mlx_embed_generate
+from openai import OpenAI
 
 import viz_server
 
@@ -46,14 +53,14 @@ from graph_store import (
     COMMITMENT_STATUSES,
     COMMITMENT_PRIORITIES,
 )
+from spotify_tool import build_spotify_tools
 from voice_pipeline import (
     check_prerequisites,
     record_until_silence,
     transcribe,
     _flush_sentences,
-    OLLAMA_HOST,
-    OLLAMA_MODEL,
-    OLLAMA_KEEP_ALIVE,
+    MLX_LM_HOST,
+    MLX_LM_MODEL,
     KOKORO_VOICE,
 )
 
@@ -61,14 +68,18 @@ from voice_pipeline import (
 # CONFIGURATION
 # ---------------------------------------------------------------------------
 
-PROJECT_ROOT  = pathlib.Path(__file__).parent
-PYTHON_EXE    = str(PROJECT_ROOT / "venv" / "bin" / "python")
-KOKORO_SCRIPT = str(PROJECT_ROOT / "kokoro_server.py")
-KOKORO_URL    = "http://127.0.0.1:8181"
-OLLAMA_PLIST  = pathlib.Path.home() / "Library/LaunchAgents/homebrew.mxcl.ollama.plist"
+PROJECT_ROOT   = pathlib.Path(__file__).parent
+PYTHON_EXE     = str(PROJECT_ROOT / "venv" / "bin" / "python")
+KOKORO_SCRIPT  = str(PROJECT_ROOT / "kokoro_server.py")
+KOKORO_URL     = "http://127.0.0.1:8181"
+MLX_LM_SCRIPT  = "-m"   # launched as: python -m mlx_lm server ...
 
-EMBED_MODEL   = "nomic-embed-text"
-EMBED_DIM     = int(os.getenv("LM_EMBEDDING_DIM", "768"))
+EMBED_MODEL    = "mlx-community/mxbai-embed-large-v1"
+EMBED_DIM      = int(os.getenv("LM_EMBEDDING_DIM", "1024"))
+
+# Module-level embedding model (loaded once at startup, reused across turns)
+_embed_model      = None
+_embed_tokenizer  = None
 
 # How many graph context lines to inject into the system prompt
 CONTEXT_LINES = 24
@@ -84,16 +95,13 @@ UPSERT_ENTITY_TOOL = {
     "type": "function",
     "function": {
         "name": "upsert_entity",
-        "description": (
-            "Store or update a named entity in the knowledge graph. "
-            "Call once per distinct person, place, org, object, or concept mentioned."
-        ),
+        "description": "Store or update an entity. Call for each person, place, org, object, or concept mentioned.",
         "parameters": {
             "type": "object",
             "properties": {
                 "name": {
                     "type": "string",
-                    "description": "Canonical entity name, e.g. 'Boris', 'Lyon', 'IKEA'",
+                    "description": "Entity name",
                 },
                 "type": {
                     "type": "string",
@@ -102,12 +110,12 @@ UPSERT_ENTITY_TOOL = {
                 },
                 "attributes": {
                     "type": "object",
-                    "description": "Optional key/value attributes, e.g. {\"occupation\": \"architect\"}",
+                    "description": "Key-value attributes",
                 },
                 "aliases": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Alternative names or abbreviations",
+                    "description": "Aliases or abbreviations",
                 },
             },
             "required": ["name", "type"],
@@ -119,16 +127,13 @@ UPSERT_EVENT_TOOL = {
     "type": "function",
     "function": {
         "name": "upsert_event",
-        "description": (
-            "Record an event that happened or is planned to happen. "
-            "Use for deliveries, meetings, conversations, transactions, or state changes."
-        ),
+        "description": "Record an event: delivery, meeting, conversation, transaction, or state change.",
         "parameters": {
             "type": "object",
             "properties": {
                 "title": {
                     "type": "string",
-                    "description": "Short descriptive title, e.g. 'Desk delivery Mar 23'",
+                    "description": "Short title",
                 },
                 "type": {
                     "type": "string",
@@ -137,24 +142,24 @@ UPSERT_EVENT_TOOL = {
                 },
                 "description": {
                     "type": "string",
-                    "description": "Optional longer description",
+                    "description": "Longer description",
                 },
                 "start_time": {
                     "type": "string",
-                    "description": "ISO-8601 datetime, e.g. '2025-03-23T09:00:00'. Null if unknown.",
+                    "description": "ISO-8601 start time",
                 },
                 "end_time": {
                     "type": "string",
-                    "description": "ISO-8601 datetime. Null if unknown or open-ended.",
+                    "description": "ISO-8601 end time",
                 },
                 "participants": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Names of entities involved",
+                    "description": "Participant entity names",
                 },
                 "location": {
                     "type": "string",
-                    "description": "Name of the location entity",
+                    "description": "Location entity name",
                 },
             },
             "required": ["title", "type"],
@@ -166,28 +171,25 @@ UPSERT_COMMITMENT_TOOL = {
     "type": "function",
     "function": {
         "name": "upsert_commitment",
-        "description": (
-            "Record a commitment, obligation, or task. "
-            "Use when someone has to do something by a certain time."
-        ),
+        "description": "Record a commitment or task with an owner and deadline.",
         "parameters": {
             "type": "object",
             "properties": {
                 "title": {
                     "type": "string",
-                    "description": "Short description of the obligation, e.g. 'Be present for desk delivery'",
+                    "description": "Obligation title",
                 },
                 "description": {
                     "type": "string",
-                    "description": "Optional longer explanation",
+                    "description": "Longer explanation",
                 },
                 "owner": {
                     "type": "string",
-                    "description": "Name of the entity responsible",
+                    "description": "Responsible entity name",
                 },
                 "due_time": {
                     "type": "string",
-                    "description": "ISO-8601 deadline. Null if unspecified.",
+                    "description": "ISO-8601 deadline",
                 },
                 "status": {
                     "type": "string",
@@ -201,7 +203,7 @@ UPSERT_COMMITMENT_TOOL = {
                 },
                 "related_event_title": {
                     "type": "string",
-                    "description": "Title of the related event, if any",
+                    "description": "Related event title",
                 },
             },
             "required": ["title"],
@@ -213,43 +215,40 @@ ADD_RELATION_TOOL = {
     "type": "function",
     "function": {
         "name": "add_relation",
-        "description": (
-            "Record a typed relationship between two graph objects. "
-            f"type must be one of: {', '.join(sorted(ALLOWED_RELATION_TYPES))}."
-        ),
+        "description": "Record a typed relationship between two objects.",
         "parameters": {
             "type": "object",
             "properties": {
                 "from_name": {
                     "type": "string",
-                    "description": "Name or title of the source object",
+                    "description": "Source name or title",
                 },
                 "from_object_type": {
                     "type": "string",
                     "enum": ["entity", "event", "commitment"],
-                    "description": "Graph type of the source object",
+                    "description": "Source object type",
                 },
                 "to_name": {
                     "type": "string",
-                    "description": "Name or title of the target object",
+                    "description": "Target name or title",
                 },
                 "to_object_type": {
                     "type": "string",
                     "enum": ["entity", "event", "commitment"],
-                    "description": "Graph type of the target object",
+                    "description": "Target object type",
                 },
                 "type": {
                     "type": "string",
                     "enum": sorted(ALLOWED_RELATION_TYPES),
-                    "description": "Relationship type",
+                    "description": "Relation type",
                 },
                 "valid_from": {
                     "type": "string",
-                    "description": "ISO-8601 datetime when this relation became true. Null if unknown.",
+                    "description": "ISO-8601 start",
                 },
                 "valid_to": {
                     "type": "string",
-                    "description": "ISO-8601 datetime when this relation ceased to be true. Null if ongoing.",
+                    "description": "ISO-8601 end",
                 },
             },
             "required": ["from_name", "from_object_type", "to_name", "to_object_type", "type"],
@@ -261,17 +260,13 @@ DELETE_ENTITY_TOOL = {
     "type": "function",
     "function": {
         "name": "delete_entity",
-        "description": (
-            "Permanently delete a named entity from the knowledge graph, "
-            "removing all its relations and embeddings. "
-            "Use only when explicitly asked to forget or remove an entity."
-        ),
+        "description": "Permanently delete an entity and all its relations. Only use when explicitly asked to forget something.",
         "parameters": {
             "type": "object",
             "properties": {
                 "name": {
                     "type": "string",
-                    "description": "Exact name of the entity to delete, e.g. 'Boris', 'Lyon'",
+                    "description": "Entity name",
                 },
             },
             "required": ["name"],
@@ -282,6 +277,9 @@ DELETE_ENTITY_TOOL = {
 TOOLS = [UPSERT_ENTITY_TOOL, UPSERT_EVENT_TOOL, UPSERT_COMMITMENT_TOOL,
          ADD_RELATION_TOOL, DELETE_ENTITY_TOOL]
 
+# Populated by main() if Spotify credentials are available
+spotify_client = None
+
 # ---------------------------------------------------------------------------
 # BROWSER CHAT HANDLER
 # ---------------------------------------------------------------------------
@@ -290,7 +288,7 @@ _chat_lock = threading.Lock()
 
 
 def make_chat_handler(
-    client: ollama.Client,
+    client: OpenAI,
     gs: GraphStore,
     conversation: list[dict],
     embed_available: bool,
@@ -299,13 +297,20 @@ def make_chat_handler(
     """
     Return a generator function: handle(message) → yields SSE-formatted strings.
     Called by viz_server for each POST /chat request.
+
+    Two-pass architecture:
+      Pass 1  silent, full TOOLS schema → collect + apply graph writes
+      Pass 2  no tools, SPEAK_PROMPT + tool_summary → stream spoken reply
+              max_tokens=80 (voice) or 200 (text) for sub-second TTFT
     """
 
     def handle(message: str):
-        actual = message.strip()
+        actual   = message.strip()
+        is_voice = (actual == "/v")
+        context  = ""  # populated in Pass 1, forwarded to Pass 2
 
-        # ── Voice mode ("/v") ─────────────────────────────────────────────────
-        if actual == "/v":
+        # ── Voice input: record + transcribe ─────────────────────────────────
+        if is_voice:
             yield f"data: {json.dumps({'type': 'status', 'text': 'Listening…'})}\n\n"
             try:
                 audio = record_until_silence()
@@ -326,67 +331,115 @@ def make_chat_handler(
             log.info("[voice] %s", actual)
             yield f"data: {json.dumps({'type': 'transcript', 'text': actual})}\n\n"
 
-        # ── LLM turn ──────────────────────────────────────────────────────────
         with _chat_lock:
-            context = _build_context(gs, client, actual, embed_available)
-            system  = SYSTEM_PROMPT_BASE
-            if context:
-                system += "\n\n" + context
+            # ── Pass 1: silent — graph writes only ────────────────────────────
+            context = _build_context(gs, actual, embed_available)
+            system_p1 = SYSTEM_PROMPT_BASE + ("\n\n" + context if context else "")
 
-            msgs = [{"role": "system", "content": system}]
-            msgs.extend(conversation)
-            msgs.append({"role": "user", "content": actual})
+            p1_msgs = [{"role": "system", "content": system_p1}]
+            p1_msgs.extend(conversation)
+            p1_msgs.append({"role": "user", "content": actual})
 
-            full_response: str = ""
             collected_tools: list[dict] = []
+            tool_results:    list[str]  = []
 
             try:
-                stream = client.chat(
-                    model=OLLAMA_MODEL,
-                    messages=msgs,
-                    tools=TOOLS,
+                _, collected_tools = _run_pass1(client, p1_msgs)
+            except Exception as exc:
+                log.warning("Pass 1 error: %s", exc)
+                yield f"data: {json.dumps({'type': 'error', 'text': str(exc)})}\n\n"
+                yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                return
+
+            if collected_tools:
+                tool_results = _apply_tool_calls(
+                    gs, collected_tools, embed_executor, embed_available
+                )
+                for tc in collected_tools:
+                    args  = tc["arguments"]
+                    label = (
+                        args.get("name") or args.get("title")
+                        or args.get("query") or tc["name"]
+                    ).strip()
+                    yield f"data: {json.dumps({'type': 'tool', 'fn': tc['name'], 'label': label})}\n\n"
+
+            # ── Pass 2: speak-only — fast spoken reply ────────────────────────
+            # Inject what was just written so the reply can reference it.
+            tool_summary = _build_tool_summary(collected_tools)
+            user_p2 = actual
+            if tool_summary:
+                user_p2 += f"\n\n[{tool_summary}]"
+            if tool_results:
+                # Surface Spotify / query-tool results as live context
+                user_p2 += "\n\n[Live data: " + "; ".join(r for r in tool_results if r) + "]"
+            if context:
+                # Forward existing graph context so Pass 2 can answer retrieval questions
+                graph_lines = context.replace("Relevant knowledge graph context:\n", "")
+                user_p2 += f"\n\n[Memory: {graph_lines}]"
+
+            # Prevent Pass 2 from hallucinating Spotify actions when no tool fired
+            _play_words = {"play", "pause", "skip", "stop", "resume", "queue"}
+            if not tool_results and any(w in actual.lower() for w in _play_words):
+                user_p2 += (
+                    "\n\n[No Spotify action was executed this turn. "
+                    "Do NOT claim you played, paused, or queued anything. "
+                    "If the user asked to play something, say you could not do it and ask them to try again.]"
+                )
+
+            p2_msgs = [{"role": "system", "content": SPEAK_PROMPT}]
+            p2_msgs.extend(conversation)
+            p2_msgs.append({"role": "user", "content": user_p2})
+
+            # Voice turns are token-budget constrained for under-second TTFT;
+            # text turns allow a fuller reply.
+            max_tok = 80 if is_voice else 200
+
+            full_response   = ""
+            sentence_buffer = ""
+
+            try:
+                stream = client.chat.completions.create(
+                    model=MLX_LM_MODEL,
+                    messages=p2_msgs,
                     stream=True,
-                    options={"think": False},
-                    keep_alive=OLLAMA_KEEP_ALIVE,
+                    max_tokens=max_tok,
                 )
 
                 for chunk in stream:
-                    msg = chunk.message
-                    if msg.tool_calls:
-                        for tc in msg.tool_calls:
-                            collected_tools.append({
-                                "name":      tc.function.name,
-                                "arguments": tc.function.arguments or {},
-                            })
-
-                    fragment = msg.content or ""
+                    choice = chunk.choices[0] if chunk.choices else None
+                    if choice is None:
+                        continue
+                    fragment = choice.delta.content or ""
                     full_response += fragment
                     if fragment:
                         yield f"data: {json.dumps({'type': 'token', 'text': fragment})}\n\n"
 
-                    if chunk.done:
+                    if is_voice:
+                        sentence_buffer += fragment
+                        sentences, sentence_buffer = _flush_sentences(sentence_buffer)
+                        for s in sentences:
+                            _tts_play(s)
+
+                    if choice.finish_reason:
                         break
 
-                conversation.append({"role": "user",      "content": actual})
-                conversation.append({"role": "assistant", "content": full_response})
-                log.info("Chat: %s → %s…", actual[:60], full_response[:80])
-
-                if collected_tools:
-                    _apply_tool_calls(
-                        gs, collected_tools, embed_executor, client, embed_available
-                    )
-                    for tc in collected_tools:
-                        args  = tc["arguments"]
-                        label = (
-                            args.get("name") or args.get("title") or tc["name"]
-                        ).strip()
-                        yield f"data: {json.dumps({'type': 'tool', 'fn': tc['name'], 'label': label})}\n\n"
+                # Flush any trailing fragment
+                if is_voice and sentence_buffer.strip():
+                    _tts_play(sentence_buffer)
 
             except Exception as exc:
-                log.warning("Chat error: %s", exc)
+                log.warning("Pass 2 error: %s", exc)
                 yield f"data: {json.dumps({'type': 'error', 'text': str(exc)})}\n\n"
 
-            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+            # Append the Pass 2 response to history (what the user actually heard/saw)
+            conversation.append({"role": "user",      "content": actual})
+            conversation.append({"role": "assistant", "content": full_response})
+            log.info(
+                "2-pass turn: %d tool(s) | %s → %s…",
+                len(collected_tools), actual[:50], full_response[:80],
+            )
+
+        yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
     return handle
 
@@ -395,60 +448,90 @@ SYSTEM_PROMPT_BASE = (
     "You are a helpful voice assistant with a persistent memory.\n"
     "Respond concisely in plain spoken language. "
     "Do not use markdown, bullet points, or special characters.\n"
-    "After your spoken reply, call upsert_entity, upsert_event, upsert_commitment, "
-    "and add_relation for every entity, event, commitment, and relationship you "
-    "learned this turn. Use ISO-8601 dates wherever times are mentioned.\n"
+    "After your spoken reply, call upsert_entity for every person, place, or "
+    "organisation mentioned — one call per entity, never combined. "
+    "Call upsert_event for every meeting, delivery, or state change. "
+    "Call upsert_commitment for every task or obligation. "
+    "Call add_relation for every relationship you learned. "
+    "Use ISO-8601 dates wherever times are mentioned.\n"
+    "When a task or commitment is mentioned as completed, finished, cancelled, or "
+    "done, call upsert_commitment with the matching title and status set to the "
+    "appropriate value. Only call delete_entity when the user explicitly asks to "
+    "forget or remove something.\n"
+    "Do NOT log Spotify actions to the knowledge graph. "
+    "When the user asks to play or hear a song: call spotify_play immediately with "
+    "the song name as the query — never call spotify_now_playing first. "
+    "If the song name comes from graph memory context (e.g. 'play the song in my memory'), "
+    "extract the entity name from the context and use it as the spotify_play query. "
+    "Use spotify_control for pause/resume/skip/volume. "
+    "Use spotify_now_playing ONLY when asked what is currently playing. "
+    "Use spotify_recently_played for listening history. "
+    "Use spotify_queue for what is coming up next.\n"
+)
+
+# Pass 2 spoken-reply prompt — kept deliberately short (~25 tokens) so
+# TTFT on Pass 2 approaches the bare-minimum baseline (~0.4 s on 7B-4bit).
+SPEAK_PROMPT = (
+    "You are a helpful voice assistant. "
+    "Reply in 1–2 spoken sentences. "
+    "No markdown, no bullet points, no filler phrases."
 )
 
 # ---------------------------------------------------------------------------
 # START-UP HELPERS
 # ---------------------------------------------------------------------------
 
-def ensure_ollama_running() -> ollama.Client:
-    """Return an Ollama client, starting the service via launchctl if needed."""
-    client = ollama.Client(host=OLLAMA_HOST)
+def ensure_mlx_server() -> OpenAI:
+    """
+    Return an OpenAI client pointed at the mlx-lm server.
+    Starts the server as a subprocess if it is not already responding.
+    The first startup can be slow if the model weights need downloading.
+    """
+    client = OpenAI(base_url=f"{MLX_LM_HOST}/v1", api_key="mlx")
     try:
-        client.list()
-        log.info("Ollama already running.")
+        client.models.list()
+        log.info("mlx-lm server already running.")
         return client
     except Exception:
         pass
 
-    log.info("Ollama not responding — loading launchd service…")
-    subprocess.run(
-        ["launchctl", "load", "-w", str(OLLAMA_PLIST)],
-        check=False,
+    log.info("Starting mlx-lm server (model: %s)…", MLX_LM_MODEL)
+    subprocess.Popen(
+        [PYTHON_EXE, MLX_LM_SCRIPT, "mlx_lm", "server",
+         "--model", MLX_LM_MODEL,
+         "--host", "127.0.0.1",
+         "--port", "8080"],
+        stdout=subprocess.DEVNULL,
+        stderr=sys.stderr,
     )
-    deadline = time.monotonic() + 20
+
+    # Allow up to 120 s — first run downloads weights (~4 GB)
+    deadline = time.monotonic() + 120
     while time.monotonic() < deadline:
         try:
-            client.list()
-            log.info("Ollama started.")
+            client.models.list()
+            log.info("mlx-lm server ready.")
             return client
         except Exception:
-            time.sleep(1)
+            time.sleep(2)
 
-    log.error("Ollama did not start within 20 s. Check %s", OLLAMA_PLIST)
+    log.error("mlx-lm server did not start within 120 s.")
     sys.exit(1)
 
 
-def ensure_embed_model(client: ollama.Client) -> bool:
-    """Pull nomic-embed-text if absent. Returns True when available."""
+def ensure_embed_model() -> bool:
+    """
+    Load the mlx-embeddings model into the module-level globals.
+    Returns True on success, False if unavailable (semantic context disabled).
+    """
+    global _embed_model, _embed_tokenizer
     try:
-        names = [m.model for m in client.list().models]
-    except Exception:
-        return False
-
-    if any(EMBED_MODEL in n for n in names):
-        return True
-
-    log.info("Pulling %s…", EMBED_MODEL)
-    try:
-        client.pull(EMBED_MODEL)
-        log.info("%s ready.", EMBED_MODEL)
+        log.info("Loading embedding model %s…", EMBED_MODEL)
+        _embed_model, _embed_tokenizer = mlx_embed_load(EMBED_MODEL)
+        log.info("Embedding model ready (%d-dim).", EMBED_DIM)
         return True
     except Exception as exc:
-        log.warning("Could not pull %s: %s — semantic context disabled", EMBED_MODEL, exc)
+        log.warning("Could not load embedding model: %s — semantic context disabled", exc)
         return False
 
 
@@ -486,10 +569,15 @@ def ensure_kokoro_server() -> None:
 # EMBEDDING + CONTEXT
 # ---------------------------------------------------------------------------
 
-def _get_embedding(client: ollama.Client, text: str) -> list[float] | None:
+def _get_embedding(text: str) -> list[float] | None:
+    """Embed text with the in-process mlx-embeddings model; L2-normalise the vector."""
+    if _embed_model is None:
+        return None
     try:
-        resp = client.embed(model=EMBED_MODEL, input=text)
-        return resp.embeddings[0]
+        out = mlx_embed_generate(_embed_model, _embed_tokenizer, [text])
+        v   = out.text_embeds[0]              # shape (EMBED_DIM,)
+        v   = v / mx.sqrt(mx.sum(v * v))      # L2 normalise
+        return v.tolist()
     except Exception as exc:
         log.debug("embed failed: %s", exc)
         return None
@@ -497,7 +585,6 @@ def _get_embedding(client: ollama.Client, text: str) -> list[float] | None:
 
 def _build_context(
     gs: GraphStore,
-    client: ollama.Client,
     transcript: str,
     embed_available: bool,
 ) -> str:
@@ -525,37 +612,50 @@ def _build_context(
 
     # 1. Semantic search across all types
     if embed_available:
-        emb = _get_embedding(client, transcript)
+        emb = _get_embedding(transcript)
         if emb:
             for hit in gs.semantic_search(emb, top_n=8):
                 _add(hit["object_id"], hit["object_type"],
                      hit["subtype"] or "", hit["display_name"])
 
-    # 2. Cross-type name search using first meaningful word
+    # 2. Cross-type name search using all meaningful words
     words = [w for w in transcript.split() if len(w) > 3]
-    if words:
-        for hit in gs.search_by_name(words[0], limit=5):
+    seen_keywords: set[str] = set()
+    for word in words:
+        if word.lower() in seen_keywords:
+            continue
+        seen_keywords.add(word.lower())
+        for hit in gs.search_by_name(word, limit=3):
             _add(hit["object_id"], hit["object_type"],
                  hit["subtype"] or "", hit["display_name"])
+        if len(lines) >= CONTEXT_LINES:
+            break
 
-    # 3. Expand neighbors of first semantic/name hit
-    if seen_ids:
-        first_id = next(iter(seen_ids))
-        # Determine type of first hit by checking which table it's in
-        first_type = "entity"
+    # 3. Expand neighbors of each matched hit with relation types
+    for hit_id in list(seen_ids):
+        # Determine type of this hit
+        hit_type = "entity"
         with gs._lock:
             if gs._conn.execute(
-                "SELECT 1 FROM events WHERE id::TEXT = ?", [first_id]
+                "SELECT 1 FROM events WHERE id::TEXT = ?", [hit_id]
             ).fetchone():
-                first_type = "event"
+                hit_type = "event"
             elif gs._conn.execute(
-                "SELECT 1 FROM commitments WHERE id::TEXT = ?", [first_id]
+                "SELECT 1 FROM commitments WHERE id::TEXT = ?", [hit_id]
             ).fetchone():
-                first_type = "commitment"
-        for nb in gs._query_neighbors_by_id(first_id, first_type, hops=1):
-            _add(nb["object_id"], nb["object_type"],
-                 nb["subtype"] or "", nb["display_name"],
-                 f"{nb['hops']}-hop")
+                hit_type = "commitment"
+        for rel in gs.get_direct_relations(hit_id, hit_type):
+            neighbor_name = rel["neighbor_name"]
+            rel_type      = rel["rel_type"]
+            direction     = rel["direction"]
+            extra = (
+                f"—[{rel_type}]→ {neighbor_name}"
+                if direction == "outgoing"
+                else f"←[{rel_type}]— {neighbor_name}"
+            )
+            _add(rel["neighbor_id"], rel["neighbor_type"], "", neighbor_name, extra)
+        if len(lines) >= CONTEXT_LINES:
+            break
 
     # 4. Active commitments — always inject up to 3
     if len(lines) < CONTEXT_LINES:
@@ -601,40 +701,45 @@ def _tts_play(sentence: str) -> None:
 # ---------------------------------------------------------------------------
 
 def _stream_response_and_collect_tools(
-    client: ollama.Client,
+    client: OpenAI,
     messages: list[dict],
     speak: bool = True,
 ) -> tuple[str, list[dict]]:
     """
-    Stream qwen3:30b with tools and think=False.
+    Stream the mlx-lm response with tools (OpenAI-compatible streaming).
     When speak=True: synthesise and play each complete sentence via TTS.
     When speak=False: stream tokens live to stdout.
     Returns (full_response_text, list_of_tool_call_dicts).
     """
     full_response   = ""
     sentence_buffer = ""
-    tool_calls: list[dict] = []
+    tc_accum: dict[int, dict] = {}   # index → {name, arguments_str}
 
-    stream = client.chat(
-        model=OLLAMA_MODEL,
+    stream = client.chat.completions.create(
+        model=MLX_LM_MODEL,
         messages=messages,
         tools=TOOLS,
         stream=True,
-        options={"think": False},
-        keep_alive=OLLAMA_KEEP_ALIVE,
     )
 
     for chunk in stream:
-        msg = chunk.message
+        choice = chunk.choices[0] if chunk.choices else None
+        if choice is None:
+            continue
+        delta = choice.delta
 
-        if msg.tool_calls:
-            for tc in msg.tool_calls:
-                tool_calls.append({
-                    "name":      tc.function.name,
-                    "arguments": tc.function.arguments or {},
-                })
+        # Accumulate tool-call deltas (name + arguments arrive in pieces)
+        if delta.tool_calls:
+            for tc_delta in delta.tool_calls:
+                idx = tc_delta.index
+                if idx not in tc_accum:
+                    tc_accum[idx] = {"name": "", "arguments_str": ""}
+                if tc_delta.function and tc_delta.function.name:
+                    tc_accum[idx]["name"] += tc_delta.function.name
+                if tc_delta.function and tc_delta.function.arguments:
+                    tc_accum[idx]["arguments_str"] += tc_delta.function.arguments
 
-        fragment = msg.content or ""
+        fragment = delta.content or ""
         full_response   += fragment
         sentence_buffer += fragment
 
@@ -646,16 +751,134 @@ def _stream_response_and_collect_tools(
             if fragment:
                 print(fragment, end="", flush=True)
 
-        if chunk.done:
+        if choice.finish_reason:
             break
 
     if speak:
         if sentence_buffer.strip():
             _tts_play(sentence_buffer)
     else:
-        print()  # newline to close the streamed response
+        print()
+
+    # Parse accumulated tool calls
+    tool_calls: list[dict] = []
+    for idx in sorted(tc_accum.keys()):
+        tc = tc_accum[idx]
+        try:
+            args = json.loads(tc["arguments_str"]) if tc["arguments_str"] else {}
+        except json.JSONDecodeError:
+            args = {}
+        tool_calls.append({"name": tc["name"], "arguments": args})
 
     return full_response, tool_calls
+
+
+# ---------------------------------------------------------------------------
+# PASS 1 + PASS 2 HELPERS
+# ---------------------------------------------------------------------------
+
+def _run_pass1(
+    client: OpenAI,
+    messages: list[dict],
+) -> tuple[str, list[dict]]:
+    """
+    Pass 1 — silent tool-collection stream.
+    Sends the full TOOLS schema; accumulates all tool-call deltas.
+    Text output is discarded (not spoken, not shown).
+    Returns (discarded_text, list_of_{name,arguments}_dicts).
+    """
+    full_text = ""
+    tc_accum: dict[int, dict] = {}
+
+    stream = client.chat.completions.create(
+        model=MLX_LM_MODEL,
+        messages=messages,
+        tools=TOOLS,
+        stream=True,
+    )
+
+    for chunk in stream:
+        choice = chunk.choices[0] if chunk.choices else None
+        if choice is None:
+            continue
+        delta = choice.delta
+
+        if delta.tool_calls:
+            for tc_delta in delta.tool_calls:
+                idx = tc_delta.index
+                if idx not in tc_accum:
+                    tc_accum[idx] = {"name": "", "arguments_str": ""}
+                if tc_delta.function and tc_delta.function.name:
+                    tc_accum[idx]["name"] += tc_delta.function.name
+                if tc_delta.function and tc_delta.function.arguments:
+                    tc_accum[idx]["arguments_str"] += tc_delta.function.arguments
+
+        full_text += delta.content or ""
+
+        if choice.finish_reason:
+            break
+
+    tool_calls: list[dict] = []
+    for idx in sorted(tc_accum.keys()):
+        tc = tc_accum[idx]
+        try:
+            args = json.loads(tc["arguments_str"]) if tc["arguments_str"] else {}
+        except json.JSONDecodeError:
+            args = {}
+        tool_calls.append({"name": tc["name"], "arguments": args})
+
+    return full_text, tool_calls
+
+
+def _build_tool_summary(tool_calls: list[dict]) -> str:
+    """
+    Build a compact human-readable summary of graph writes to inject into
+    Pass 2's user message, so the spoken reply can reference what was noted.
+
+    Example: "Noted: Sarah (person), meeting 'Q3 planning' at 2026-05-20T14:00,
+              task 'Review roadmap' [planned], Sarah works_at Anthropic"
+    """
+    if not tool_calls:
+        return ""
+
+    parts: list[str] = []
+    for tc in tool_calls:
+        name = tc["name"]
+        args = tc["arguments"]
+
+        if name == "upsert_entity":
+            ename = args.get("name", "")
+            etype = args.get("type", "entity")
+            if ename:
+                parts.append(f"{ename} ({etype})")
+
+        elif name == "upsert_event":
+            title = args.get("title", "")
+            t     = args.get("start_time", "")
+            if title:
+                parts.append(f"event '{title}'" + (f" at {t}" if t else ""))
+
+        elif name == "upsert_commitment":
+            title  = args.get("title", "")
+            status = args.get("status", "planned")
+            if title:
+                parts.append(f"task '{title}' [{status}]")
+
+        elif name == "add_relation":
+            fn  = args.get("from_name", "")
+            rel = args.get("type", "")
+            tn  = args.get("to_name", "")
+            if fn and rel and tn:
+                parts.append(f"{fn} {rel} {tn}")
+
+        elif name == "delete_entity":
+            ename = args.get("name", "")
+            if ename:
+                parts.append(f"removed '{ename}'")
+
+        # Spotify write tools are silent — their results come back via tool_results
+
+    return ("Noted: " + ", ".join(parts)) if parts else ""
 
 
 # ---------------------------------------------------------------------------
@@ -689,20 +912,22 @@ def _resolve_object_id(
     return str(row[0]) if row else None
 
 
+
 def _apply_tool_calls(
     gs: GraphStore,
     tool_calls: list[dict],
     embed_executor: ThreadPoolExecutor,
-    client: ollama.Client,
     embed_available: bool,
-) -> None:
+) -> list[str]:
     """
     Execute graph writes fire-and-forget.
     Schedule background embedding jobs for newly upserted objects.
     Handles all 4 tool names (upsert_entity, upsert_event, upsert_commitment,
     add_relation) plus legacy upsert_node / add_edge for robustness.
+    Returns a list of result strings from query tools (e.g. spotify_now_playing).
     """
     upserted: list[tuple[str, str]] = []  # (object_id, object_type)
+    tool_results: list[str] = []
 
     for tc in tool_calls:
         name = tc["name"]
@@ -841,10 +1066,72 @@ def _apply_tool_calls(
             if from_n and to_n and rel:
                 gs.submit_add_edge(from_n, to_n, rel, weight)
 
+        # ── spotify_play ──────────────────────────────────────────────
+        elif name == "spotify_play" and spotify_client:
+            try:
+                result = spotify_client.play(
+                    args.get("query", ""),
+                    args.get("queue", False),
+                )
+                tool_results.append(result)
+                log.info("spotify_play: %s", result)
+            except Exception as exc:
+                msg = f"Spotify error: {exc}"
+                tool_results.append(msg)
+                log.warning(msg)
+
+        # ── spotify_control ───────────────────────────────────────────
+        elif name == "spotify_control" and spotify_client:
+            try:
+                result = spotify_client.control(
+                    args.get("action", ""),
+                    args.get("volume"),
+                )
+                tool_results.append(result)
+                log.info("spotify_control: %s", result)
+            except Exception as exc:
+                msg = f"Spotify error: {exc}"
+                tool_results.append(msg)
+                log.warning(msg)
+
+        # ── spotify_now_playing ───────────────────────────────────────
+        elif name == "spotify_now_playing" and spotify_client:
+            try:
+                result = spotify_client.now_playing()
+                tool_results.append(result)
+                log.info("spotify_now_playing: %s", result)
+            except Exception as exc:
+                msg = f"Spotify error: {exc}"
+                tool_results.append(msg)
+                log.warning(msg)
+
+        # ── spotify_recently_played ───────────────────────────────────
+        elif name == "spotify_recently_played" and spotify_client:
+            try:
+                limit  = int(args.get("limit", 5))
+                result = spotify_client.recently_played(limit=limit)
+                tool_results.append(result)
+                log.info("spotify_recently_played: %s", result)
+            except Exception as exc:
+                msg = f"Spotify error: {exc}"
+                tool_results.append(msg)
+                log.warning(msg)
+
+        # ── spotify_queue ─────────────────────────────────────────────
+        elif name == "spotify_queue" and spotify_client:
+            try:
+                result = spotify_client.queue()
+                tool_results.append(result)
+                log.info("spotify_queue: %s", result)
+            except Exception as exc:
+                msg = f"Spotify error: {exc}"
+                tool_results.append(msg)
+                log.warning(msg)
+
     # Background embedding: fires after audio has played, no voice impact
     if embed_available and upserted:
         def _embed_and_store(object_id: str, object_type: str, display_name: str) -> None:
-            emb = _get_embedding(client, display_name)
+            emb = _get_embedding(display_name)
             if emb:
                 gs.update_object_embedding(object_id, object_type, emb)
 
@@ -868,6 +1155,8 @@ def _apply_tool_calls(
             if row:
                 embed_executor.submit(_embed_and_store, oid, otype, row[0])
 
+    return tool_results
+
 
 # ---------------------------------------------------------------------------
 # MAIN
@@ -878,13 +1167,13 @@ def main() -> None:
 
     log.info("=== Living Memory starting up ===")
 
-    # 1. Ollama
-    client = ensure_ollama_running()
+    # 1. mlx-lm inference server
+    client = ensure_mlx_server()
 
-    # 2. Embedding model
-    embed_available = ensure_embed_model(client)
+    # 2. Embedding model (in-process)
+    embed_available = ensure_embed_model()
     if not embed_available:
-        log.warning("Semantic context disabled (nomic-embed-text unavailable).")
+        log.warning("Semantic context disabled (embedding model unavailable).")
 
     # 3. Kokoro TTS server
     ensure_kokoro_server()
@@ -896,6 +1185,18 @@ def main() -> None:
         "Graph loaded: %d entities, %d events, %d commitments, %d relations",
         s0["entities"], s0["events"], s0["commitments"], s0["relations"],
     )
+
+    # 4. Spotify (optional — graceful if credentials absent or spotipy not installed)
+    global spotify_client
+    spotify_tools, spotify_client = build_spotify_tools()
+    if spotify_tools:
+        TOOLS.extend(spotify_tools)
+        log.info(
+            "Spotify tools enabled: %s",
+            [t["function"]["name"] for t in spotify_tools],
+        )
+    else:
+        log.info("Spotify tools not available.")
 
     # Background thread for embedding jobs (single worker, non-blocking)
     embed_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="embedder")

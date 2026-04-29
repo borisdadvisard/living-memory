@@ -1,10 +1,12 @@
 """
 spotify_tool.py — Spotify playback tools for Living Memory
 
-Provides three LLM-callable tools:
-  - spotify_play       : search and play (or queue) a track, artist, or playlist
-  - spotify_control    : pause, resume, skip, set volume
-  - spotify_now_playing: return the currently playing track as a speakable string
+Provides five LLM-callable tools:
+  - spotify_play            : search and play (or queue) a track, artist, or playlist
+  - spotify_control         : pause, resume, skip, set volume
+  - spotify_now_playing     : return the currently playing track as a speakable string
+  - spotify_recently_played : list the most recently played tracks
+  - spotify_queue           : list the upcoming tracks in the playback queue
 
 No graph writes are performed — Spotify actions are pure side effects / queries.
 
@@ -21,7 +23,10 @@ import http.server
 import json
 import logging
 import os
+import subprocess
+import sys
 import threading
+import time
 import webbrowser
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
@@ -168,7 +173,8 @@ class SpotifyClient:
     SCOPES = (
         "user-read-playback-state "
         "user-modify-playback-state "
-        "user-read-currently-playing"
+        "user-read-currently-playing "
+        "user-read-recently-played"
     )
 
     def __init__(self) -> None:
@@ -194,6 +200,41 @@ class SpotifyClient:
 
         self.sp = spotipy.Spotify(auth_manager=auth_manager)
         log.info("SpotifyClient initialised (redirect_uri=%s).", redirect_uri)
+
+    # ── app launch ────────────────────────────────────────────────────────
+
+    def _ensure_spotify_open(self, timeout: float = 8.0) -> bool:
+        """
+        Open the Spotify desktop app if no device is currently visible.
+        On macOS uses `open -a Spotify`. On other platforms no-ops.
+        Polls up to `timeout` seconds for a device to appear.
+        Returns True if a device became available, False if timed out.
+        """
+        devices = self.sp.devices().get("devices", [])
+        if devices:
+            return True  # already available, nothing to do
+
+        if sys.platform != "darwin":
+            log.info("Non-macOS platform — cannot auto-open Spotify.")
+            return False
+
+        log.info("No Spotify device found — launching Spotify app…")
+        try:
+            subprocess.Popen(["open", "-a", "Spotify"])
+        except FileNotFoundError:
+            log.warning("'open' command not found — cannot launch Spotify.")
+            return False
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            time.sleep(1.5)
+            devices = self.sp.devices().get("devices", [])
+            if devices:
+                log.info("Spotify device ready: %s", devices[0]["name"])
+                return True
+
+        log.warning("Spotify did not register a device within %.0fs.", timeout)
+        return False
 
     # ── device resolution ─────────────────────────────────────────────────
 
@@ -224,8 +265,19 @@ class SpotifyClient:
         if not query.strip():
             return "Please provide something to search for."
 
+        # Ensure Spotify is running before we attempt playback
+        self._ensure_spotify_open()
+
+        # Prefer track-only search for precision; fall back to broader search only
+        # for clearly non-track queries (playlists, moods, artists without a title).
+        _broad_hints = ("playlist", "mix", "radio", "vibes", "mood", "music")
+        search_type = (
+            "track,playlist,artist"
+            if any(h in query.lower() for h in _broad_hints)
+            else "track"
+        )
         try:
-            results = self.sp.search(q=query, limit=1, type="track,playlist,artist")
+            results = self.sp.search(q=query, limit=3, type=search_type)
         except spotipy.exceptions.SpotifyException as exc:
             return f"Spotify search failed: {exc}"
 
@@ -238,6 +290,12 @@ class SpotifyClient:
         artists   = (results.get("artists")   or {}).get("items", [])
 
         if tracks:
+            # Log all candidates so search quality is visible in the terminal
+            for i, t in enumerate(tracks):
+                log.info(
+                    "spotify_play candidate[%d]: %s by %s",
+                    i, t["name"], t["artists"][0]["name"],
+                )
             uri   = tracks[0]["uri"]
             label = f"{tracks[0]['name']} by {tracks[0]['artists'][0]['name']}"
             is_single_track = True
@@ -249,6 +307,8 @@ class SpotifyClient:
             label = artists[0]["name"]
         else:
             return f"Nothing found on Spotify for: {query}"
+
+        log.info("spotify_play search: query=%r → %r (uri=%s)", query, label, uri)
 
         try:
             device_id = self._get_device_id()
@@ -263,10 +323,15 @@ class SpotifyClient:
                 self.sp.start_playback(device_id=device_id, uris=[uri])
             else:
                 self.sp.start_playback(device_id=device_id, context_uri=uri)
+            log.info("spotify_play started: %s (device=%s)", label, device_id)
             return f"Now playing: {label}"
         except spotipy.exceptions.SpotifyException as exc:
             if exc.http_status == 403:
                 return "Spotify Premium is required for playback control."
+            log.warning("spotify_play start_playback failed: %s", exc)
+            return f"Spotify error: {exc}"
+        except Exception as exc:
+            log.warning("spotify_play unexpected error: %s", exc)
             return f"Spotify error: {exc}"
 
     # ── control ───────────────────────────────────────────────────────────
@@ -338,6 +403,78 @@ class SpotifyClient:
         parts.append(f"{progress_pct}% through.")
         return " — ".join(parts)
 
+    # ── recently_played ───────────────────────────────────────────────────
+
+    def recently_played(self, limit: int = 5) -> str:
+        """
+        Return a speakable list of the most recently played tracks.
+        """
+        limit = max(1, min(limit, 10))
+        try:
+            result = self.sp.current_user_recently_played(limit=limit)
+        except spotipy.exceptions.SpotifyException as exc:
+            return f"Spotify error: {exc}"
+
+        items = (result or {}).get("items", [])
+        if not items:
+            return "No recently played tracks found."
+
+        # De-duplicate: the API can return the same track multiple times
+        # if it was played in a loop; keep first occurrence only.
+        seen: set[str] = set()
+        lines: list[str] = []
+        for i, item in enumerate(items, start=1):
+            track = item.get("track") or {}
+            uri = track.get("uri", "")
+            if uri in seen:
+                continue
+            seen.add(uri)
+            name    = track.get("name", "Unknown")
+            artists = ", ".join(a["name"] for a in track.get("artists", []))
+            lines.append(f"{len(lines)+1}. {name} by {artists}")
+            if len(lines) >= limit:
+                break
+
+        return "Recently played: " + "; ".join(lines) + "."
+
+    # ── queue ─────────────────────────────────────────────────────────────
+
+    def queue(self) -> str:
+        """
+        Return a speakable description of the upcoming playback queue.
+        """
+        try:
+            result = self.sp.queue()
+        except spotipy.exceptions.SpotifyException as exc:
+            return f"Spotify error: {exc}"
+
+        if not result:
+            return "Could not retrieve the queue."
+
+        currently = result.get("currently_playing")
+        upcoming  = result.get("queue") or []
+
+        parts: list[str] = []
+
+        if currently:
+            name    = currently.get("name", "Unknown")
+            artists = ", ".join(a["name"] for a in currently.get("artists", []))
+            parts.append(f"Now playing: {name} by {artists}.")
+
+        if not upcoming:
+            parts.append("Nothing else in the queue.")
+        else:
+            next_tracks = upcoming[:5]
+            track_strs  = [
+                f"{t.get('name', 'Unknown')} by {', '.join(a['name'] for a in t.get('artists', []))}"
+                for t in next_tracks
+            ]
+            parts.append("Up next: " + "; ".join(track_strs) + ".")
+            if len(upcoming) > 5:
+                parts.append(f"Plus {len(upcoming) - 5} more.")
+
+        return " ".join(parts)
+
 
 # ---------------------------------------------------------------------------
 # Tool JSON schemas
@@ -348,9 +485,11 @@ SPOTIFY_PLAY_TOOL = {
     "function": {
         "name": "spotify_play",
         "description": (
-            "Search Spotify and play or queue a track, artist, or playlist. "
-            "Use for requests like 'play some jazz', 'put on a workout playlist', "
-            "'queue Bohemian Rhapsody', or 'play something by Daft Punk'."
+            "Search Spotify and immediately play or queue a track, artist, or playlist. "
+            "Use ANY time the user wants to hear something — 'play X', 'put on X', "
+            "'play the song in memory', 'play the song linked to Spotify'. "
+            "If the song name comes from graph memory context, use that name as the query. "
+            "Do NOT call spotify_now_playing before calling this — just play directly."
         ),
         "parameters": {
             "type": "object",
@@ -358,8 +497,11 @@ SPOTIFY_PLAY_TOOL = {
                 "query": {
                     "type": "string",
                     "description": (
-                        "Search query, e.g. 'Daft Punk', 'Bohemian Rhapsody', "
-                        "'chill lo-fi hip hop playlist'."
+                        "Search query for Spotify. "
+                        "For a specific known song, use field filter syntax for precision: "
+                        "track:\"Song Title\" artist:\"Artist Name\" — "
+                        "e.g. track:\"Billie Jean\" artist:\"Michael Jackson\". "
+                        "For casual requests use plain text: 'Daft Punk', 'chill lo-fi playlist'."
                     ),
                 },
                 "queue": {
@@ -410,8 +552,48 @@ SPOTIFY_NOW_PLAYING_TOOL = {
         "name": "spotify_now_playing",
         "description": (
             "Get the currently playing track on Spotify. "
-            "Use when the user asks 'what's playing?', 'what song is this?', "
-            "'who sings this?', or 'what album is this from?'."
+            "ONLY use when the user asks what is playing RIGHT NOW — "
+            "'what's playing?', 'what song is this?', 'who sings this?', 'what album is this from?'. "
+            "Do NOT use this when the user wants to play a song — use spotify_play instead."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+}
+
+SPOTIFY_RECENTLY_PLAYED_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "spotify_recently_played",
+        "description": (
+            "Get the user's recently played tracks on Spotify. "
+            "Use when the user asks 'what was the last song?', 'what have I been "
+            "listening to?', 'what did I play earlier?', or 'show my listening history'."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "description": "Number of recent tracks to return (1–10, default 5).",
+                },
+            },
+            "required": [],
+        },
+    },
+}
+
+SPOTIFY_QUEUE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "spotify_queue",
+        "description": (
+            "Get the current Spotify playback queue. "
+            "Use when the user asks 'what's coming up?', 'what's next?', "
+            "'what's in my queue?', or 'what songs are queued?'."
         ),
         "parameters": {
             "type": "object",
@@ -442,7 +624,13 @@ def build_spotify_tools() -> tuple[list[dict], "SpotifyClient | None"]:
 
     try:
         client = SpotifyClient()
-        schemas = [SPOTIFY_PLAY_TOOL, SPOTIFY_CONTROL_TOOL, SPOTIFY_NOW_PLAYING_TOOL]
+        schemas = [
+            SPOTIFY_PLAY_TOOL,
+            SPOTIFY_CONTROL_TOOL,
+            SPOTIFY_NOW_PLAYING_TOOL,
+            SPOTIFY_RECENTLY_PLAYED_TOOL,
+            SPOTIFY_QUEUE_TOOL,
+        ]
         return schemas, client
     except ValueError as exc:
         log.warning("Spotify credentials missing — tools disabled: %s", exc)

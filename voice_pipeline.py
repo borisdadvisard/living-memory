@@ -4,11 +4,11 @@ voice_pipeline.py — Living Memory voice loop
 Stages:
   1. Record mic audio with energy-based VAD (sounddevice)
   2. Transcribe with whisper-cli subprocess (Metal GPU)
-  3. Send transcript to Ollama qwen3:30b (localhost:11434, streaming)
+  3. Send transcript to mlx-lm server (localhost:8080, OpenAI-compatible, streaming)
   4. Synthesise each sentence with Kokoro ONNX (CPU)
   5. Play audio through speaker (sounddevice, blocking per sentence)
 
-GPU timeline is strictly sequential: Whisper exits before Ollama starts;
+GPU timeline is strictly sequential: Whisper exits before mlx-lm starts;
 Kokoro never touches Metal.
 """
 
@@ -23,7 +23,7 @@ import pathlib
 
 import numpy as np
 import sounddevice as sd
-import ollama
+from openai import OpenAI
 from kokoro_onnx import Kokoro
 
 # ---------------------------------------------------------------------------
@@ -46,10 +46,9 @@ KOKORO_SPEED       = 1.0
 KOKORO_LANG        = "en-us"
 KOKORO_SR          = 24000      # hard-coded in kokoro_onnx/config.py
 
-# Ollama LLM
-OLLAMA_HOST        = "http://localhost:11434"
-OLLAMA_MODEL       = "qwen3:30b"
-OLLAMA_KEEP_ALIVE  = "10m"
+# mlx-lm inference server (OpenAI-compatible)
+MLX_LM_HOST  = "http://localhost:8080"
+MLX_LM_MODEL = "mlx-community/Qwen2.5-7B-Instruct-4bit"
 
 # Microphone / VAD
 MIC_SR             = 16000      # whisper-cli requires 16 kHz input
@@ -249,22 +248,24 @@ def _synthesise_and_play(tts: Kokoro, text: str) -> None:
 
 def respond_and_speak(tts: Kokoro, messages: list[dict]) -> str:
     """
-    Stream the Ollama response, synthesise and play each complete sentence
+    Stream the mlx-lm response, synthesise and play each complete sentence
     as soon as it arrives. Returns the full response text.
     """
-    client = ollama.Client(host=OLLAMA_HOST)
+    client = OpenAI(base_url=f"{MLX_LM_HOST}/v1", api_key="mlx")
     full_response = ""
     sentence_buffer = ""
 
-    stream = client.chat(
-        model=OLLAMA_MODEL,
+    stream = client.chat.completions.create(
+        model=MLX_LM_MODEL,
         messages=messages,
         stream=True,
-        keep_alive=OLLAMA_KEEP_ALIVE,
     )
 
     for chunk in stream:
-        fragment = chunk.message.content or ""
+        choice = chunk.choices[0] if chunk.choices else None
+        if choice is None:
+            continue
+        fragment = choice.delta.content or ""
         full_response += fragment
         sentence_buffer += fragment
 
@@ -272,7 +273,7 @@ def respond_and_speak(tts: Kokoro, messages: list[dict]) -> str:
         for sentence in sentences:
             _synthesise_and_play(tts, sentence)
 
-        if chunk.done:
+        if choice.finish_reason:
             break
 
     # Flush any trailing fragment (response may not end with punctuation)
@@ -337,15 +338,12 @@ def main() -> None:
         except KeyboardInterrupt:
             log.info("Shutting down.")
             break
-        except ollama.ResponseError as exc:
-            log.error("Ollama error: %s", exc)
-            # Remove the poisoned user message so history stays clean
-            if conversation and conversation[-1]["role"] == "user":
-                conversation.pop()
         except subprocess.TimeoutExpired:
             log.error("whisper-cli timed out — skipping turn")
         except Exception as exc:  # noqa: BLE001
-            log.exception("Unexpected error: %s", exc)
+            log.error("LLM / unexpected error: %s", exc)
+            if conversation and conversation[-1]["role"] == "user":
+                conversation.pop()
 
 
 if __name__ == "__main__":
